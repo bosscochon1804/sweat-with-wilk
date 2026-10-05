@@ -1,0 +1,1 @@
+{"description":"Sweat With Wilk — standalone live bet tracker (zero-dependency Node).","engines":{"node":">=22"},"license":"UNLICENSED","main":"server.js","name":"sweat-with-wilk","private":true,"scripts":{"start":"node server.js"},"version":"1.0.0"}

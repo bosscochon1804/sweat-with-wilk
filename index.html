@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#080d0c">
+<title>Sweat With Wilk</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js" defer></script>
+</head>
+<body>
+<header class="app-header">
+  <div class="brand">
+    <div class="brand-name">SWEAT WITH WILK</div>
+    <div class="brand-tag">Sweat your ticket, play by play.</div>
+  </div>
+  <button id="alerts-bell" class="icon-btn" aria-label="Alerts" hidden>
+    🔔<span id="alerts-badge" class="badge" hidden>0</span>
+  </button>
+</header>
+
+<main id="main">
+  <section id="view-tickets" class="view"></section>
+  <section id="view-scores" class="view" hidden></section>
+  <section id="view-community" class="view" hidden></section>
+  <section id="view-board" class="view" hidden></section>
+  <section id="view-bankroll" class="view" hidden></section>
+  <section id="view-account" class="view" hidden></section>
+</main>
+
+<div id="sheet-root"></div>
+
+<nav class="bottom-nav">
+  <button data-nav="tickets" class="nav-btn active"><span class="nav-ico">🎟️</span><span>Tickets</span></button>
+  <button data-nav="scores" class="nav-btn"><span class="nav-ico">📊</span><span>Scores</span></button>
+  <button data-nav="community" class="nav-btn"><span class="nav-ico">💬</span><span>Community</span></button>
+  <button data-nav="board" class="nav-btn"><span class="nav-ico">📋</span><span>Board</span></button>
+  <button data-nav="bankroll" class="nav-btn"><span class="nav-ico">💰</span><span>Bankroll</span></button>
+  <button data-nav="account" class="nav-btn"><span class="nav-ico">👤</span><span>Account</span></button>
+</nav>
+
+<script src="/app.js"></script>
+<script>
+if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js').catch(() => {}); }
+</script>
+</body>
+</html>
