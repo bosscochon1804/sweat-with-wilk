@@ -26,6 +26,7 @@ const LEAGUES = ['NFL', 'NBA', 'MLB', 'NHL', 'NCAAF', 'WNBA', 'NCAAB', 'NCAAW', 
 const state = {
   user: null, settings: null, tickets: [], view: 'tickets',
   scoresLeague: 'NFL', scoresCache: {}, boardDate: null,
+  newsLeague: 'NFL',
   detailCache: new Map(), blockTab: new Map(), fullPlays: new Set(),
   alerts: null, communityCache: null,
 };
@@ -58,7 +59,7 @@ async function refreshAlertBadge() {
   } catch { /* ignore */ }
 }
 function render() {
-  ({ tickets: renderTickets, scores: renderScores, community: renderCommunity, board: renderBoard, bankroll: renderBankroll, account: renderAccount })[state.view]();
+  ({ tickets: renderTickets, scores: renderScores, news: renderNews, community: renderCommunity, board: renderBoard, bankroll: renderBankroll, account: renderAccount })[state.view]();
 }
 
 /* ================= TICKETS ================= */
@@ -424,6 +425,29 @@ async function renderScores() {
   }
 }
 function setScoresLeague(l) { state.scoresLeague = l; renderScores(); }
+
+/* ================= NEWS ================= */
+async function renderNews() {
+  const el = $('#view-news');
+  const chips = LEAGUES.map((l) => `<button class="chip ${state.newsLeague === l ? 'on' : ''}" onclick="setNewsLeague('${l}')">${l}</button>`).join('');
+  el.innerHTML = `<h2>Sports News</h2><div class="small muted" style="margin:-6px 2px 12px">The latest from ESPN — injuries, trades, and the storylines that move lines. Know what's going on before you sweat it.</div><div class="chips">${chips}</div><div id="news-list"><div class="empty">Loading news…</div></div>`;
+  try {
+    const d = await api('GET', `/api/news?league=${state.newsLeague}`);
+    const list = $('#news-list');
+    if (!list) return;
+    if (d.error) { list.innerHTML = `<div class="err">${esc(d.error)}</div>`; return; }
+    list.innerHTML = (d.items.length ? d.items.map((a) => `
+      <div class="card tight">
+        ${a.url ? `<a class="news-head" href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.headline)}</a>` : `<div class="news-head">${esc(a.headline)}</div>`}
+        ${a.description ? `<div class="small" style="margin-top:4px">${esc(a.description)}</div>` : ''}
+        <div class="tiny muted" style="margin-top:6px">${esc(a.source || 'ESPN')} · ${esc(fmtDateTime(a.published))}</div>
+      </div>`).join('') : '<div class="card"><div class="empty">No headlines right now.</div></div>')
+      + `<div class="small muted">Updated ${fmtDateTime(d.fetchedAt)}</div>`;
+  } catch (e) {
+    const list = $('#news-list'); if (list) list.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
+}
+function setNewsLeague(l) { state.newsLeague = l; renderNews(); }
 async function openGameDetail(league, eventId) {
   const blockId = `score-${eventId}`;
   openSheet(`<h3>Game Detail</h3><div id="gd-body"><div class="empty">Loading…</div></div><button class="btn secondary" style="margin-top:12px" onclick="closeSheet()">Close</button>`);
@@ -670,5 +694,5 @@ async function saveQuiet() {
   await refreshMe();
   render();
 })();
-setInterval(() => { if (state.view === 'tickets') renderTickets(); else if (state.view === 'scores') renderScores(); refreshAlertBadge(); }, 30000);
+setInterval(() => { if (state.view === 'tickets') renderTickets(); else if (state.view === 'scores') renderScores(); else if (state.view === 'news') renderNews(); refreshAlertBadge(); }, 30000);
 setInterval(() => { if ((state.view === 'tickets' || state.view === 'scores')) render(); }, 15000);
