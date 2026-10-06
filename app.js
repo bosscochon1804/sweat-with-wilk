@@ -59,6 +59,7 @@ async function refreshAlertBadge() {
   } catch { /* ignore */ }
 }
 function render() {
+  refreshAlertBadge();
   ({ tickets: renderTickets, scores: renderScores, news: renderNews, community: renderCommunity, board: renderBoard, bankroll: renderBankroll, account: renderAccount })[state.view]();
 }
 
@@ -702,21 +703,3 @@ async function saveQuiet() {
   await refreshMe();
   render();
 })();
-setInterval(async () => {
-  refreshAlertBadge();
-  if ($('#sheet-root').firstChild) return; // a detail/add sheet is open — leave the page alone
-  if (state.view !== 'tickets' && state.view !== 'scores' && state.view !== 'news') return;
-  const y = window.scrollY;
-  try {
-    if (state.view === 'tickets') {
-      if (!state.user) return;
-      await loadTickets();
-      renderTicketsLight();
-    } else if (state.view === 'scores') {
-      await renderScores();
-    } else if (state.view === 'news') {
-      await renderNews();
-    }
-  } catch { /* a hiccup keeps the current page instead of blanking it */ }
-  window.scrollTo(0, y);
-}, 20000);
