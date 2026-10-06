@@ -528,32 +528,6 @@ async function renderBankroll() {
 }
 
 /* ================= COMMUNITY ================= */
-/* ================= COMMUNITY HOOK ================= */
-const DAILY_PROMPTS = [
-  'NFL Sunday — who is your lock of the day? Drop it BEFORE kickoff. 🏈',
-  'Monday night sweat — what are you riding tonight?',
-  'Bad beat confessional: what is the worst beat you have taken lately? 😤',
-  'Prop night — call ONE player prop you would bet the house on. Receipts live here. 🎯',
-  'Thursday night lights — spread or total: which side are you on, and why?',
-  'Weekend bankroll check — what is your ONE must-play this weekend?',
-  'Full-slate Saturday — post your whole ticket and let the room sweat it with you. 🎟️',
-];
-function pinnedHookHTML() {
-  const prompt = DAILY_PROMPTS[new Date().getDay()];
-  return `<div class="card" style="border-color:var(--mint);background:var(--card2)">
-    <div class="row between"><strong>📌 Sweat With Wilk</strong><span class="pill on">Pinned</span></div>
-    <div style="font-weight:900;font-size:19px;line-height:1.25;margin-top:6px">Welcome to the room — don't sweat your ticket alone. 🔥</div>
-    <div style="margin-top:6px">This is where the tickets talk. Post your slip, call your picks, talk props — and prove you're the best predictor here. The leaderboard runs on <strong>real graded tickets only</strong>, no fake receipts.</div>
-    <div style="margin-top:8px">
-      <div style="padding:2px 0">🎟️ <strong>Post your ticket</strong> — add it under Tickets, share it to the room</div>
-      <div style="padding:2px 0">🎯 <strong>Call your shot</strong> — your best pick, BEFORE the games start</div>
-      <div style="padding:2px 0">🏆 <strong>Climb the board</strong> — wins and profit take the crown</div>
-    </div>
-    <div class="pill" style="display:block;margin-top:10px;padding:9px 12px;border-radius:10px;color:var(--text)">💬 <strong>Today's question:</strong> ${prompt}</div>
-    ${state.user ? '' : '<button class="btn" style="margin-top:10px;width:100%" onclick="showView(\'account\')">Sign in & join the room</button>'}
-  </div>`;
-}
-
 async function renderCommunity() {
   const el = $('#view-community');
   el.innerHTML = '<h2>Community</h2><div id="comm-body"><div class="empty">Loading the room…</div></div>';
@@ -580,8 +554,7 @@ async function renderCommunity() {
       <h3>Predictions Leaderboard</h3>
       <div class="card tight">${d.leaderboard.length ? d.leaderboard.map((r, i) => `<div class="leader-row"><span>${i + 1}. <strong>${esc(r.name)}</strong></span><span class="muted">${r.wins}W-${r.losses}L · ${r.winRate}% · <span style="color:${r.netProfit >= 0 ? 'var(--mint)' : 'var(--red)'}">${fmtMoney(r.netProfit)}</span></span></div>`).join('') : '<div class="empty">No graded results yet — the board fills in from real settled tickets only.</div>'}</div>
       <h3>The Room</h3>
-      ${pinnedHookHTML()}
-      ${d.posts.length ? d.posts.map(postHTML).join('') : '<div class="card"><div class="empty">The room is quiet — for now. First take sets the tone: answer today\'s question up top, or drop your ticket and let the room sweat it with you. 🎯</div></div>'}`;
+      ${d.posts.length ? d.posts.map(postHTML).join('') : '<div class="card"><div class="empty">The room is empty — be the first to post a ticket or a take.</div></div>'}`;
   } catch (e) {
     $('#comm-body').innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
