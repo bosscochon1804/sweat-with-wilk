@@ -1,6 +1,6 @@
 /* Sweat With Wilk service worker — caches the app shell for an app-like install.
    API calls are never cached. */
-const CACHE = 'sww-shell-v2';
+const CACHE = 'sww-shell-v3';
 const SHELL = ['/', '/index.html', '/app.js', '/styles.css', '/manifest.json', '/icon.svg'];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

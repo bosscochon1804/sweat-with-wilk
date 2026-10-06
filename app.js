@@ -226,7 +226,7 @@ function ticketCardHTML(t) {
 async function renderTickets() {
   const el = $('#view-tickets');
   if (!state.user) { el.innerHTML = '<h2>Your Tickets</h2>' + signInPromptHTML('Sign in to add tickets and sweat them live, play by play.'); return; }
-  el.innerHTML = `<div class="row between"><h2>Your Tickets</h2><button class="btn" onclick="openAddTicket()">+ Add Ticket</button></div><div id="tickets-list"><div class="empty">Loading…</div></div>`;
+  if (!$('#tickets-list')) el.innerHTML = `<div class="row between"><h2>Your Tickets</h2><button class="btn" onclick="openAddTicket()">+ Add Ticket</button></div><div id="tickets-list"><div class="empty">Loading…</div></div>`;
   try {
     await loadTickets();
     const open = state.tickets.filter((t) => t.status === 'open');
@@ -397,8 +397,12 @@ async function saveTicket() {
 /* ================= SCORES ================= */
 async function renderScores() {
   const el = $('#view-scores');
-  const chips = LEAGUES.map((l) => `<button class="chip ${state.scoresLeague === l ? 'on' : ''}" onclick="setScoresLeague('${l}')">${l}</button>`).join('');
-  el.innerHTML = `<h2>Scores</h2><div class="chips">${chips}</div><div id="your-games"></div><div id="scores-list"><div class="empty">Loading scores…</div></div>`;
+  if (!$('#scores-list')) {
+    const chips = LEAGUES.map((l) => `<button class="chip ${state.scoresLeague === l ? 'on' : ''}" onclick="setScoresLeague('${l}')">${l}</button>`).join('');
+    el.innerHTML = `<h2>Scores</h2><div class="chips">${chips}</div><div id="your-games"></div><div id="scores-list"><div class="empty">Loading scores…</div></div>`;
+  } else {
+    $$('.chip', el).forEach((c) => c.classList.toggle('on', c.textContent === state.scoresLeague));
+  }
   // Your games first
   if (state.user) {
     try {
@@ -429,8 +433,12 @@ function setScoresLeague(l) { state.scoresLeague = l; renderScores(); }
 /* ================= NEWS ================= */
 async function renderNews() {
   const el = $('#view-news');
-  const chips = LEAGUES.map((l) => `<button class="chip ${state.newsLeague === l ? 'on' : ''}" onclick="setNewsLeague('${l}')">${l}</button>`).join('');
-  el.innerHTML = `<h2>Sports News</h2><div class="small muted" style="margin:-6px 2px 12px">The latest from ESPN — injuries, trades, and the storylines that move lines. Know what's going on before you sweat it.</div><div class="chips">${chips}</div><div id="news-list"><div class="empty">Loading news…</div></div>`;
+  if (!$('#news-list')) {
+    const chips = LEAGUES.map((l) => `<button class="chip ${state.newsLeague === l ? 'on' : ''}" onclick="setNewsLeague('${l}')">${l}</button>`).join('');
+    el.innerHTML = `<h2>Sports News</h2><div class="small muted" style="margin:-6px 2px 12px">The latest from ESPN — injuries, trades, and the storylines that move lines. Know what's going on before you sweat it.</div><div class="chips">${chips}</div><div id="news-list"><div class="empty">Loading news…</div></div>`;
+  } else {
+    $$('.chip', el).forEach((c) => c.classList.toggle('on', c.textContent === state.newsLeague));
+  }
   try {
     const d = await api('GET', `/api/news?league=${state.newsLeague}`);
     const list = $('#news-list');
@@ -694,5 +702,21 @@ async function saveQuiet() {
   await refreshMe();
   render();
 })();
-setInterval(() => { if (state.view === 'tickets') renderTickets(); else if (state.view === 'scores') renderScores(); else if (state.view === 'news') renderNews(); refreshAlertBadge(); }, 30000);
-setInterval(() => { if ((state.view === 'tickets' || state.view === 'scores')) render(); }, 15000);
+setInterval(async () => {
+  refreshAlertBadge();
+  if ($('#sheet-root').firstChild) return; // a detail/add sheet is open — leave the page alone
+  if (state.view !== 'tickets' && state.view !== 'scores' && state.view !== 'news') return;
+  const y = window.scrollY;
+  try {
+    if (state.view === 'tickets') {
+      if (!state.user) return;
+      await loadTickets();
+      renderTicketsLight();
+    } else if (state.view === 'scores') {
+      await renderScores();
+    } else if (state.view === 'news') {
+      await renderNews();
+    }
+  } catch { /* a hiccup keeps the current page instead of blanking it */ }
+  window.scrollTo(0, y);
+}, 20000);
