@@ -1,11 +1,12 @@
 'use strict';
 /* Sweat With Wilk — standalone bet tracker.
-   Zero external dependencies: node:http, node:sqlite, node:crypto, global fetch. */
+   Dependencies: node:http, node:crypto, global fetch, and @libsql/client
+   (Turso/libSQL storage — remote when TURSO_DATABASE_URL is set, else the local DB file). */
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { createClient } = require('@libsql/client');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'app.db');
@@ -16,9 +17,40 @@ fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 /* ---------------- database ---------------- */
-const db = new DatabaseSync(DB_PATH);
-db.exec(`
-PRAGMA journal_mode = WAL;
+/* Data layer — libSQL via @libsql/client. Remote Turso when TURSO_DATABASE_URL
+   is set; otherwise the same local SQLite file as before (file: URL). The adapter
+   keeps the old node:sqlite call shapes (prepare -> get/all/run) but every method
+   is async: get -> first row as a plain object (or undefined), all -> plain rows,
+   run -> { lastInsertRowid, changes }. BigInt values are coerced to Number. */
+const DB_URL = process.env.TURSO_DATABASE_URL || ('file:' + DB_PATH);
+const client = createClient({ url: DB_URL, authToken: process.env.TURSO_AUTH_TOKEN || undefined });
+function plainRow(row, columns) {
+  const out = {};
+  for (const c of columns) {
+    const v = row[c];
+    out[c] = typeof v === 'bigint' ? Number(v) : v;
+  }
+  return out;
+}
+const db = {
+  prepare(sql) {
+    return {
+      async get(...args) {
+        const rs = await client.execute({ sql, args });
+        return rs.rows.length ? plainRow(rs.rows[0], rs.columns) : undefined;
+      },
+      async all(...args) {
+        const rs = await client.execute({ sql, args });
+        return rs.rows.map((r) => plainRow(r, rs.columns));
+      },
+      async run(...args) {
+        const rs = await client.execute({ sql, args });
+        return { lastInsertRowid: rs.lastInsertRowid == null ? 0 : Number(rs.lastInsertRowid), changes: rs.rowsAffected };
+      },
+    };
+  },
+};
+const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT UNIQUE NOT NULL,
@@ -147,7 +179,13 @@ CREATE TABLE IF NOT EXISTS alert_leg_states (
   state_json TEXT NOT NULL DEFAULT '{}',
   updated_at TEXT NOT NULL
 );
-`);
+`;
+
+async function initDb() {
+  // WAL is a local-file journaling mode; remote Turso manages its own storage.
+  if (DB_URL.startsWith('file:')) await client.execute('PRAGMA journal_mode = WAL');
+  await client.executeMultiple(SCHEMA_SQL);
+}
 
 /* ---------------- small utils ---------------- */
 const nowISO = () => new Date().toISOString();
@@ -219,35 +257,35 @@ function etHourNow() {
 }
 
 /* ---------------- auth ---------------- */
-function currentUser(req) {
+async function currentUser(req) {
   const token = parseCookies(req).sww_session;
   if (!token) return null;
-  const s = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
+  const s = await db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
   if (!s) return null;
   if (new Date(s.expires_at) < new Date()) {
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    await db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
     return null;
   }
-  const u = db.prepare('SELECT id, username, email, display_name, created_at FROM users WHERE id = ?').get(s.user_id);
+  const u = await db.prepare('SELECT id, username, email, display_name, created_at FROM users WHERE id = ?').get(s.user_id);
   return u || null;
 }
-function startSession(res, userId) {
+async function startSession(res, userId) {
   const token = crypto.randomBytes(32).toString('hex');
   const exp = new Date(Date.now() + 30 * 86400000).toISOString();
-  db.prepare('INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)').run(token, userId, nowISO(), exp);
+  await db.prepare('INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)').run(token, userId, nowISO(), exp);
   res.setHeader('Set-Cookie', `sww_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${30 * 86400}`);
   return token;
 }
-function endSession(req, res) {
+async function endSession(req, res) {
   const token = parseCookies(req).sww_session;
-  if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  if (token) await db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
   res.setHeader('Set-Cookie', 'sww_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
 }
-function getSettings(userId) {
-  let s = db.prepare('SELECT * FROM settings WHERE user_id = ?').get(userId);
+async function getSettings(userId) {
+  let s = await db.prepare('SELECT * FROM settings WHERE user_id = ?').get(userId);
   if (!s) {
-    db.prepare('INSERT INTO settings (user_id) VALUES (?)').run(userId);
-    s = db.prepare('SELECT * FROM settings WHERE user_id = ?').get(userId);
+    await db.prepare('INSERT INTO settings (user_id) VALUES (?)').run(userId);
+    s = await db.prepare('SELECT * FROM settings WHERE user_id = ?').get(userId);
   }
   return { defaultBook: s.default_book, startingBankroll: s.starting_bankroll, unitSize: s.unit_size };
 }
@@ -679,7 +717,7 @@ function parseBoostedPayout(notes) {
   return m ? parseFloat(m[1].replace(/,/g, '')) : null;
 }
 async function settleTicket(ticket) {
-  const legs = db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(ticket.id);
+  const legs = await db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(ticket.id);
   let changed = false;
   const leaguesNeeded = [...new Set(legs.filter((l) => l.status === 'pending' || l.status === 'live').map((l) => l.league))];
   const leagueGames = {};
@@ -690,7 +728,7 @@ async function settleTicket(ticket) {
     const game = matchGameForLeg(leg, games);
     if (!game) continue;
     if (game.id !== leg.event_id) {
-      db.prepare('UPDATE legs SET event_id = ? WHERE id = ?').run(game.id, leg.id);
+      await db.prepare('UPDATE legs SET event_id = ? WHERE id = ?').run(game.id, leg.id);
       leg.event_id = game.id; changed = true;
     }
     const prop = parseProp(leg);
@@ -699,31 +737,31 @@ async function settleTicket(ticket) {
       if (prop) {
         const pv = await propCurrentValue(leg, game);
         if (pv && pv.available) result = gradeProp(pv.prop, pv.value, true);
-        if (pv && pv.value !== null) db.prepare('UPDATE legs SET final_value = ? WHERE id = ?').run(pv.value, leg.id);
+        if (pv && pv.value !== null) await db.prepare('UPDATE legs SET final_value = ? WHERE id = ?').run(pv.value, leg.id);
       } else {
         result = gradeTeamLeg(leg, game);
       }
       if (result) {
-        db.prepare('UPDATE legs SET status = ? WHERE id = ?').run(result, leg.id);
+        await db.prepare('UPDATE legs SET status = ? WHERE id = ?').run(result, leg.id);
         leg.status = result; changed = true;
         if (ticket.user_id) {
-          const u = db.prepare('SELECT * FROM users WHERE id = ?').get(ticket.user_id);
-          if (u) addAlert(ticket.user_id, 'leg_final', `Leg final: ${leg.selection}`, `${leg.selection} ${result.toUpperCase()} — ${game.away.abbr} ${game.away.score} @ ${game.home.abbr} ${game.home.score}`, ticket.id, game.id, `legfinal:${leg.id}:${result}`);
+          const u = await db.prepare('SELECT * FROM users WHERE id = ?').get(ticket.user_id);
+          if (u) await addAlert(ticket.user_id, 'leg_final', `Leg final: ${leg.selection}`, `${leg.selection} ${result.toUpperCase()} — ${game.away.abbr} ${game.away.score} @ ${game.home.abbr} ${game.home.score}`, ticket.id, game.id, `legfinal:${leg.id}:${result}`);
         }
       }
     } else if (game.state === 'in' && leg.status === 'pending') {
-      db.prepare('UPDATE legs SET status = ? WHERE id = ?').run('live', leg.id);
+      await db.prepare('UPDATE legs SET status = ? WHERE id = ?').run('live', leg.id);
       leg.status = 'live'; changed = true;
     }
   }
-  const freshLegs = db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(ticket.id);
+  const freshLegs = await db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(ticket.id);
   if (ticket.status === 'open') {
     const outcome = computeTicketOutcome(ticket, freshLegs);
     if (outcome) {
-      db.prepare('UPDATE tickets SET status = ?, payout = ?, settled_at = ? WHERE id = ?').run(outcome.status, outcome.payout, nowISO(), ticket.id);
+      await db.prepare('UPDATE tickets SET status = ?, payout = ?, settled_at = ? WHERE id = ?').run(outcome.status, outcome.payout, nowISO(), ticket.id);
       changed = true;
       const profit = money((outcome.payout || 0) - ticket.stake);
-      addAlert(ticket.user_id, 'ticket_settled',
+      await addAlert(ticket.user_id, 'ticket_settled',
         outcome.status === 'won' ? `Ticket cashed: +$${profit.toFixed(2)}` : outcome.status === 'lost' ? `Ticket lost: -$${money(ticket.stake).toFixed(2)}` : 'Ticket pushed',
         `${ticket.title || 'Ticket'} settled ${outcome.status.toUpperCase()} — payout $${money(outcome.payout || 0).toFixed(2)}`,
         ticket.id, null, `ticketsettled:${ticket.id}:${outcome.status}`);
@@ -736,17 +774,17 @@ async function settleAll() {
   if (settling) return;
   settling = true;
   try {
-    const open = db.prepare("SELECT * FROM tickets WHERE status = 'open'").all();
+    const open = await db.prepare("SELECT * FROM tickets WHERE status = 'open'").all();
     for (const t of open) { try { await settleTicket(t); } catch { /* keep going */ } }
   } finally { settling = false; }
 }
 
 /* ---------------- alerts engine ---------------- */
-function getPrefs(userId) {
-  let p = db.prepare('SELECT * FROM alert_prefs WHERE user_id = ?').get(userId);
+async function getPrefs(userId) {
+  let p = await db.prepare('SELECT * FROM alert_prefs WHERE user_id = ?').get(userId);
   if (!p) {
-    db.prepare('INSERT INTO alert_prefs (user_id) VALUES (?)').run(userId);
-    p = db.prepare('SELECT * FROM alert_prefs WHERE user_id = ?').get(userId);
+    await db.prepare('INSERT INTO alert_prefs (user_id) VALUES (?)').run(userId);
+    p = await db.prepare('SELECT * FROM alert_prefs WHERE user_id = ?').get(userId);
   }
   let prefs = {};
   try { prefs = JSON.parse(p.prefs || '{}'); } catch { prefs = {}; }
@@ -761,17 +799,17 @@ function inQuietHours(p) {
   if (Number.isNaN(sh) || Number.isNaN(eh)) return false;
   return sh <= eh ? (cur >= sh && cur < eh) : (cur >= sh || cur < eh);
 }
-function addAlert(userId, type, title, body, ticketId, eventId, dedupeKey) {
-  const { prefs, quietStart, quietEnd } = getPrefs(userId);
+async function addAlert(userId, type, title, body, ticketId, eventId, dedupeKey) {
+  const { prefs, quietStart, quietEnd } = await getPrefs(userId);
   if (prefs[type] === false) return;
   const held = inQuietHours({ quietStart, quietEnd }) ? 1 : 0;
   try {
-    db.prepare('INSERT INTO alerts (user_id, type, title, body, ticket_id, event_id, dedupe_key, held_quietly, is_read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)')
+    await db.prepare('INSERT INTO alerts (user_id, type, title, body, ticket_id, event_id, dedupe_key, held_quietly, is_read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)')
       .run(userId, type, title, body, ticketId || null, eventId || null, dedupeKey, held, nowISO());
   } catch { /* duplicate dedupe_key — never fire the same event twice */ }
 }
-function alertsEnabledFor(userId, ticketId, eventId) {
-  const rows = db.prepare('SELECT * FROM alert_subs WHERE user_id = ?').all(userId);
+async function alertsEnabledFor(userId, ticketId, eventId) {
+  const rows = await db.prepare('SELECT * FROM alert_subs WHERE user_id = ?').all(userId);
   for (const r of rows) {
     if (r.scope === 'ticket' && r.ticket_id === ticketId && !r.on_flag) return false;
     if (r.scope === 'game' && r.event_id === String(eventId) && !r.on_flag) return false;
@@ -779,9 +817,9 @@ function alertsEnabledFor(userId, ticketId, eventId) {
   return true;
 }
 async function alertCycle() {
-  const open = db.prepare("SELECT * FROM tickets WHERE status = 'open'").all();
+  const open = await db.prepare("SELECT * FROM tickets WHERE status = 'open'").all();
   for (const ticket of open) {
-    const legs = db.prepare('SELECT * FROM legs WHERE ticket_id = ?').all(ticket.id);
+    const legs = await db.prepare('SELECT * FROM legs WHERE ticket_id = ?').all(ticket.id);
     const leaguesNeeded = [...new Set(legs.map((l) => l.league))];
     const leagueGames = {};
     for (const lg of leaguesNeeded) leagueGames[lg] = await gamesForLeague(lg);
@@ -789,14 +827,14 @@ async function alertCycle() {
       if (['won', 'lost', 'push'].includes(leg.status)) continue;
       const game = matchGameForLeg(leg, leagueGames[leg.league] || []);
       if (!game) continue;
-      if (!alertsEnabledFor(ticket.user_id, ticket.id, game.id)) continue;
-      const prevRow = db.prepare('SELECT * FROM alert_leg_states WHERE leg_id = ?').get(leg.id);
+      if (!(await alertsEnabledFor(ticket.user_id, ticket.id, game.id))) continue;
+      const prevRow = await db.prepare('SELECT * FROM alert_leg_states WHERE leg_id = ?').get(leg.id);
       let prev = {};
       try { prev = prevRow ? JSON.parse(prevRow.state_json || '{}') : {}; } catch { prev = {}; }
       const state = { gameState: game.state, detail: game.detail };
       // game start
       if (prev.gameState === 'pre' && game.state === 'in') {
-        addAlert(ticket.user_id, 'game_start', `Game started: ${game.away.name} @ ${game.home.name}`, leg.selection, ticket.id, game.id, `gamestart:${leg.id}:${game.id}`);
+        await addAlert(ticket.user_id, 'game_start', `Game started: ${game.away.name} @ ${game.home.name}`, leg.selection, ticket.id, game.id, `gamestart:${leg.id}:${game.id}`);
       }
       // leg flip (team/total legs)
       const prop = parseProp(leg);
@@ -804,7 +842,7 @@ async function alertCycle() {
         const live = liveTeamLegState(leg, game);
         state.legLive = live;
         if (prev.legLive && live && prev.legLive !== live && (live === 'winning' || live === 'losing')) {
-          addAlert(ticket.user_id, 'leg_flip', `Leg flipped: ${leg.selection}`, `Now ${live.toUpperCase()} — ${game.away.abbr} ${game.away.score} @ ${game.home.abbr} ${game.home.score} (${game.detail})`, ticket.id, game.id, `legflip:${leg.id}:${live}:${game.away.score}-${game.home.score}`);
+          await addAlert(ticket.user_id, 'leg_flip', `Leg flipped: ${leg.selection}`, `Now ${live.toUpperCase()} — ${game.away.abbr} ${game.away.score} @ ${game.home.abbr} ${game.home.score} (${game.detail})`, ticket.id, game.id, `legflip:${leg.id}:${live}:${game.away.score}-${game.home.score}`);
         }
       } else {
         const pv = await propCurrentValue(leg, game);
@@ -812,7 +850,7 @@ async function alertCycle() {
           state.propValue = pv.value;
           const crossed = pv.prop.dir === 'over' ? pv.value > pv.prop.line : pv.value >= pv.prop.line;
           if (crossed && !prev.propCrossed) {
-            addAlert(ticket.user_id, 'prop_cross', `Prop crossed: ${leg.selection}`, `${pv.prop.player} at ${pv.value} vs line ${pv.prop.line} (${pv.prop.statLabel})`, ticket.id, game.id, `propcross:${leg.id}`);
+            await addAlert(ticket.user_id, 'prop_cross', `Prop crossed: ${leg.selection}`, `${pv.prop.player} at ${pv.value} vs line ${pv.prop.line} (${pv.prop.statLabel})`, ticket.id, game.id, `propcross:${leg.id}`);
           }
           state.propCrossed = crossed;
           // heuristic dead: late in the final period, still short of an Over line
@@ -821,22 +859,22 @@ async function alertCycle() {
             if (latePeriod && game.period >= latePeriod) {
               const clockSec = (() => { const m = String(game.clock || '').match(/(\d+):(\d+)/); return m ? Number(m[1]) * 60 + Number(m[2]) : null; })();
               if (clockSec !== null && clockSec <= 60 && !prev.propDead) {
-                addAlert(ticket.user_id, 'prop_dead', `Prop in trouble: ${leg.selection}`, `${pv.prop.player} needs ${pv.prop.line} (${pv.prop.statLabel}), at ${pv.value} with under a minute left`, ticket.id, game.id, `propdead:${leg.id}`);
+                await addAlert(ticket.user_id, 'prop_dead', `Prop in trouble: ${leg.selection}`, `${pv.prop.player} needs ${pv.prop.line} (${pv.prop.statLabel}), at ${pv.value} with under a minute left`, ticket.id, game.id, `propdead:${leg.id}`);
                 state.propDead = true;
               }
             }
           }
         }
       }
-      db.prepare('INSERT INTO alert_leg_states (leg_id, user_id, state_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(leg_id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at')
+      await db.prepare('INSERT INTO alert_leg_states (leg_id, user_id, state_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(leg_id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at')
         .run(leg.id, ticket.user_id, JSON.stringify(state), nowISO());
     }
   }
 }
 
 /* ---------------- serialization ---------------- */
-function ticketJSON(t) {
-  const legs = db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(t.id);
+async function ticketJSON(t) {
+  const legs = await db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(t.id);
   const combined = legs.reduce((a, l) => a * decimalFromAmerican(l.odds), 1);
   return {
     id: t.id, title: t.title, sportsbook: t.sportsbook, stake: t.stake, notes: t.notes,
@@ -851,7 +889,7 @@ function ticketJSON(t) {
   };
 }
 async function ticketJSONWithGames(t) {
-  const base = ticketJSON(t);
+  const base = await ticketJSON(t);
   if (t.status === 'open') {
     const leagues = [...new Set(base.legs.map((l) => l.league))];
     const map = {};
@@ -861,16 +899,16 @@ async function ticketJSONWithGames(t) {
     }
     base.games = {};
     for (const leg of base.legs) {
-      const legsRaw = db.prepare('SELECT * FROM legs WHERE id = ?').get(leg.id);
+      const legsRaw = await db.prepare('SELECT * FROM legs WHERE id = ?').get(leg.id);
       const game = matchGameForLeg(legsRaw, Object.values(map).filter((g) => g.league === leg.league));
       if (game) base.games[leg.id] = game;
     }
   }
   return base;
 }
-function bankrollFor(userId) {
-  const s = getSettings(userId);
-  const settled = db.prepare("SELECT * FROM tickets WHERE user_id = ? AND status IN ('won','lost','push') ORDER BY settled_at DESC").all(userId);
+async function bankrollFor(userId) {
+  const s = await getSettings(userId);
+  const settled = await db.prepare("SELECT * FROM tickets WHERE user_id = ? AND status IN ('won','lost','push') ORDER BY settled_at DESC").all(userId);
   let wins = 0, losses = 0, pushes = 0, net = 0, staked = 0;
   const byDayMap = new Map();
   for (const t of settled) {
@@ -899,26 +937,27 @@ function bankrollFor(userId) {
     byDay: [...byDayMap.values()].sort((a, b) => b.date.localeCompare(a.date)),
   };
 }
-function communityJSON(viewer) {
-  const posts = db.prepare('SELECT p.*, u.username, u.display_name FROM community_posts p JOIN users u ON u.id = p.user_id ORDER BY p.id DESC LIMIT 100').all();
+async function communityJSON(viewer) {
+  const posts = await db.prepare('SELECT p.*, u.username, u.display_name FROM community_posts p JOIN users u ON u.id = p.user_id ORDER BY p.id DESC LIMIT 100').all();
   const out = [];
   for (const p of posts) {
-    const comments = db.prepare('SELECT c.*, u.username, u.display_name FROM community_comments c JOIN users u ON u.id = c.user_id WHERE c.post_id = ? ORDER BY c.id').all(p.id)
+    const comments = (await db.prepare('SELECT c.*, u.username, u.display_name FROM community_comments c JOIN users u ON u.id = c.user_id WHERE c.post_id = ? ORDER BY c.id').all(p.id))
       .map((c) => ({ id: c.id, authorName: displayNameOf(c), body: c.body, createdAt: c.created_at }));
-    const reactions = ['respect', 'tail', 'hot'].map((r) => {
-      const cnt = db.prepare('SELECT COUNT(*) AS n FROM community_reactions WHERE post_id = ? AND reaction = ?').get(p.id, r).n;
-      const mine = viewer ? !!db.prepare('SELECT id FROM community_reactions WHERE post_id = ? AND user_id = ? AND reaction = ?').get(p.id, viewer.id, r) : false;
-      return { reaction: r, count: cnt, mine };
-    });
+    const reactions = [];
+    for (const r of ['respect', 'tail', 'hot']) {
+      const cnt = (await db.prepare('SELECT COUNT(*) AS n FROM community_reactions WHERE post_id = ? AND reaction = ?').get(p.id, r)).n;
+      const mine = viewer ? !!(await db.prepare('SELECT id FROM community_reactions WHERE post_id = ? AND user_id = ? AND reaction = ?').get(p.id, viewer.id, r)) : false;
+      reactions.push({ reaction: r, count: cnt, mine });
+    }
     let ticket = null;
     if (p.kind === 'ticket' && p.ticket_id) {
-      const t = db.prepare('SELECT * FROM tickets WHERE id = ?').get(p.ticket_id);
-      if (t) { const tj = ticketJSON(t); ticket = { ticketId: t.id, title: tj.title, sportsbook: tj.sportsbook, stake: tj.stake, combinedOdds: tj.combinedOdds, payout: tj.potentialPayout, outcome: tj.status === 'open' ? 'live' : tj.status, legs: tj.legs }; }
+      const t = await db.prepare('SELECT * FROM tickets WHERE id = ?').get(p.ticket_id);
+      if (t) { const tj = await ticketJSON(t); ticket = { ticketId: t.id, title: tj.title, sportsbook: tj.sportsbook, stake: tj.stake, combinedOdds: tj.combinedOdds, payout: tj.potentialPayout, outcome: tj.status === 'open' ? 'live' : tj.status, legs: tj.legs }; }
     }
     out.push({ id: p.id, kind: p.kind, authorName: displayNameOf(p), body: p.body, createdAt: p.created_at, comments, reactions, ticket, mine: viewer ? p.user_id === viewer.id : false });
   }
   // leaderboard: ONLY real graded results
-  const lb = db.prepare(`
+  const lb = await db.prepare(`
     SELECT u.username, u.display_name,
       SUM(CASE WHEN t.status='won' THEN 1 ELSE 0 END) AS w,
       SUM(CASE WHEN t.status='lost' THEN 1 ELSE 0 END) AS l,
@@ -948,61 +987,61 @@ const server = http.createServer(async (req, res) => {
       if (!/^[A-Za-z0-9_.\-]{3,24}$/.test(username)) return sendJSON(res, 400, { error: 'Username must be 3–24 characters (letters, numbers, _ . -).' });
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return sendJSON(res, 400, { error: 'Enter a valid email.' });
       if (password.length < 10) return sendJSON(res, 400, { error: 'Password must be at least 10 characters.' });
-      if (db.prepare('SELECT id FROM users WHERE username = ?').get(username)) return sendJSON(res, 409, { error: 'That username is taken.' });
+      if (await db.prepare('SELECT id FROM users WHERE username = ?').get(username)) return sendJSON(res, 409, { error: 'That username is taken.' });
       const salt = newSalt();
-      const info = db.prepare('INSERT INTO users (username, email, pass_hash, salt, display_name, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      const info = await db.prepare('INSERT INTO users (username, email, pass_hash, salt, display_name, created_at) VALUES (?, ?, ?, ?, ?, ?)')
         .run(username, email, hashPassword(password, salt), salt, username, nowISO());
       const userId = Number(info.lastInsertRowid);
-      db.prepare('INSERT INTO settings (user_id) VALUES (?)').run(userId);
+      await db.prepare('INSERT INTO settings (user_id) VALUES (?)').run(userId);
       const codes = [];
       for (let i = 0; i < 8; i++) {
         const code = makeRecoveryCode();
         codes.push(code);
-        db.prepare('INSERT INTO recovery_codes (user_id, code_hash, used) VALUES (?, ?, 0)').run(userId, hashCode(code));
+        await db.prepare('INSERT INTO recovery_codes (user_id, code_hash, used) VALUES (?, ?, 0)').run(userId, hashCode(code));
       }
-      startSession(res, userId);
-      const u = db.prepare('SELECT id, username, email, display_name FROM users WHERE id = ?').get(userId);
+      await startSession(res, userId);
+      const u = await db.prepare('SELECT id, username, email, display_name FROM users WHERE id = ?').get(userId);
       return sendJSON(res, 201, { user: { id: u.id, username: u.username, email: u.email, displayName: displayNameOf(u) }, recoveryCodes: codes });
     }
     if (p === '/api/auth/signin' && req.method === 'POST') {
       const b = await readBody(req);
-      const u = db.prepare('SELECT * FROM users WHERE username = ?').get(String(b.username || '').trim());
+      const u = await db.prepare('SELECT * FROM users WHERE username = ?').get(String(b.username || '').trim());
       if (!u || hashPassword(String(b.password || ''), u.salt) !== u.pass_hash) return sendJSON(res, 401, { error: 'Wrong username or password.' });
-      startSession(res, u.id);
+      await startSession(res, u.id);
       return sendJSON(res, 200, { user: { id: u.id, username: u.username, email: u.email, displayName: displayNameOf(u) } });
     }
     if (p === '/api/auth/signout' && req.method === 'POST') {
-      endSession(req, res);
+      await endSession(req, res);
       return sendJSON(res, 200, { ok: true });
     }
     if (p === '/api/auth/reset' && req.method === 'POST') {
       const b = await readBody(req);
-      const u = db.prepare('SELECT * FROM users WHERE username = ?').get(String(b.username || '').trim());
+      const u = await db.prepare('SELECT * FROM users WHERE username = ?').get(String(b.username || '').trim());
       if (!u) return sendJSON(res, 404, { error: 'Account not found.' });
       const newPassword = String(b.newPassword || '');
       if (newPassword.length < 10) return sendJSON(res, 400, { error: 'New password must be at least 10 characters.' });
-      const rc = db.prepare('SELECT * FROM recovery_codes WHERE user_id = ? AND code_hash = ? AND used = 0').get(u.id, hashCode(String(b.code || '').trim().toUpperCase()));
+      const rc = await db.prepare('SELECT * FROM recovery_codes WHERE user_id = ? AND code_hash = ? AND used = 0').get(u.id, hashCode(String(b.code || '').trim().toUpperCase()));
       if (!rc) return sendJSON(res, 401, { error: 'That recovery code is not valid (codes work one time only).' });
       const salt = newSalt();
-      db.prepare('UPDATE users SET pass_hash = ?, salt = ? WHERE id = ?').run(hashPassword(newPassword, salt), salt, u.id);
-      db.prepare('UPDATE recovery_codes SET used = 1 WHERE id = ?').run(rc.id);
-      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id);
+      await db.prepare('UPDATE users SET pass_hash = ?, salt = ? WHERE id = ?').run(hashPassword(newPassword, salt), salt, u.id);
+      await db.prepare('UPDATE recovery_codes SET used = 1 WHERE id = ?').run(rc.id);
+      await db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id);
       return sendJSON(res, 200, { ok: true });
     }
     if (p === '/api/me' && req.method === 'GET') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 200, { user: null });
-      return sendJSON(res, 200, { user: { id: u.id, username: u.username, email: u.email, displayName: displayNameOf(u) }, settings: getSettings(u.id) });
+      return sendJSON(res, 200, { user: { id: u.id, username: u.username, email: u.email, displayName: displayNameOf(u) }, settings: await getSettings(u.id) });
     }
     if (p === '/api/settings' && req.method === 'PUT') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
       const b = await readBody(req);
-      if (b.displayName !== undefined) db.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(String(b.displayName).slice(0, 40), u.id);
-      const s = getSettings(u.id);
-      db.prepare('UPDATE settings SET default_book = ?, starting_bankroll = ?, unit_size = ? WHERE user_id = ?')
+      if (b.displayName !== undefined) await db.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(String(b.displayName).slice(0, 40), u.id);
+      const s = await getSettings(u.id);
+      await db.prepare('UPDATE settings SET default_book = ?, starting_bankroll = ?, unit_size = ? WHERE user_id = ?')
         .run(String(b.defaultBook ?? s.defaultBook).slice(0, 60), Number(b.startingBankroll ?? s.startingBankroll) || 0, Number(b.unitSize ?? s.unitSize) || 0, u.id);
-      return sendJSON(res, 200, { settings: getSettings(u.id) });
+      return sendJSON(res, 200, { settings: await getSettings(u.id) });
     }
 
     /* ---- scores / news / game detail (public) ---- */
@@ -1048,16 +1087,16 @@ const server = http.createServer(async (req, res) => {
 
     /* ---- tickets ---- */
     if (p === '/api/tickets' && req.method === 'GET') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
       await settleAll();
-      const rows = db.prepare('SELECT * FROM tickets WHERE user_id = ? ORDER BY id DESC').all(u.id);
+      const rows = await db.prepare('SELECT * FROM tickets WHERE user_id = ? ORDER BY id DESC').all(u.id);
       const out = [];
       for (const t of rows) out.push(await ticketJSONWithGames(t));
       return sendJSON(res, 200, { tickets: out });
     }
     if (p === '/api/tickets' && req.method === 'POST') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
       const b = await readBody(req);
       const legs = Array.isArray(b.legs) ? b.legs : [];
@@ -1065,25 +1104,25 @@ const server = http.createServer(async (req, res) => {
       if (legs.length > 25) return sendJSON(res, 400, { error: 'Too many legs.' });
       const notes = String(b.notes || '').slice(0, 1000);
       const boosted = b.boostedPayout ? Number(b.boostedPayout) : parseBoostedPayout(notes);
-      const info = db.prepare('INSERT INTO tickets (user_id, title, sportsbook, stake, notes, source, boosted_payout, status, external_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(u.id, String(b.title || '').slice(0, 120), String(b.sportsbook || getSettings(u.id).defaultBook || 'Hard Rock Bet').slice(0, 60),
+      const info = await db.prepare('INSERT INTO tickets (user_id, title, sportsbook, stake, notes, source, boosted_payout, status, external_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(u.id, String(b.title || '').slice(0, 120), String(b.sportsbook || (await getSettings(u.id)).defaultBook || 'Hard Rock Bet').slice(0, 60),
           Math.max(0, Number(b.stake) || 0), notes, ['manual', 'screenshot', 'morning'].includes(b.source) ? b.source : 'manual',
           boosted || null, 'open', b.externalRef ? String(b.externalRef).slice(0, 120) : null, nowISO());
       const ticketId = Number(info.lastInsertRowid);
       const ins = db.prepare('INSERT INTO legs (ticket_id, league, game_label, selection, market, line, odds, starts_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
       for (const l of legs) {
-        ins.run(ticketId, String(l.league || '').toUpperCase().slice(0, 20), String(l.gameLabel || '').slice(0, 120),
+        await ins.run(ticketId, String(l.league || '').toUpperCase().slice(0, 20), String(l.gameLabel || '').slice(0, 120),
           String(l.selection || '').slice(0, 200), String(l.market || '').slice(0, 80), String(l.line || '').slice(0, 40),
           Math.round(Number(l.odds) || -110), String(l.startsAt || '').slice(0, 40), 'pending');
       }
-      const t = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
-      return sendJSON(res, 201, { ticket: ticketJSON(t) });
+      const t = await db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
+      return sendJSON(res, 201, { ticket: await ticketJSON(t) });
     }
     const ticketImgMatch = p.match(/^\/api\/tickets\/(\d+)\/image$/);
     if (ticketImgMatch && req.method === 'POST') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
-      const t = db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?').get(Number(ticketImgMatch[1]), u.id);
+      const t = await db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?').get(Number(ticketImgMatch[1]), u.id);
       if (!t) return sendJSON(res, 404, { error: 'Ticket not found.' });
       const b = await readBody(req);
       const m = String(b.dataUrl || '').match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/);
@@ -1091,13 +1130,13 @@ const server = http.createServer(async (req, res) => {
       const ext = m[1] === 'jpeg' ? 'jpg' : m[1];
       const fname = `ticket-${t.id}.${ext}`;
       fs.writeFileSync(path.join(UPLOAD_DIR, fname), Buffer.from(m[2], 'base64'));
-      db.prepare('UPDATE tickets SET image_file = ? WHERE id = ?').run(fname, t.id);
+      await db.prepare('UPDATE tickets SET image_file = ? WHERE id = ?').run(fname, t.id);
       return sendJSON(res, 200, { ok: true });
     }
     if (ticketImgMatch && req.method === 'GET') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
-      const t = db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?').get(Number(ticketImgMatch[1]), u.id);
+      const t = await db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?').get(Number(ticketImgMatch[1]), u.id);
       if (!t || !t.image_file) return sendJSON(res, 404, { error: 'No image.' });
       const fp = path.join(UPLOAD_DIR, path.basename(t.image_file));
       if (!fs.existsSync(fp)) return sendJSON(res, 404, { error: 'No image.' });
@@ -1107,21 +1146,21 @@ const server = http.createServer(async (req, res) => {
     }
     const ticketDelMatch = p.match(/^\/api\/tickets\/(\d+)$/);
     if (ticketDelMatch && req.method === 'DELETE') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
-      const t = db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?').get(Number(ticketDelMatch[1]), u.id);
+      const t = await db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?').get(Number(ticketDelMatch[1]), u.id);
       if (!t) return sendJSON(res, 404, { error: 'Ticket not found.' });
-      db.prepare('DELETE FROM legs WHERE ticket_id = ?').run(t.id);
-      db.prepare('DELETE FROM tickets WHERE id = ?').run(t.id);
+      await db.prepare('DELETE FROM legs WHERE ticket_id = ?').run(t.id);
+      await db.prepare('DELETE FROM tickets WHERE id = ?').run(t.id);
       return sendJSON(res, 200, { ok: true });
     }
     if (p === '/api/props' && req.method === 'GET') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
       const ticketId = Number(url.searchParams.get('ticketId') || 0);
-      const t = db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?').get(ticketId, u.id);
+      const t = await db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?').get(ticketId, u.id);
       if (!t) return sendJSON(res, 404, { error: 'Ticket not found.' });
-      const legs = db.prepare('SELECT * FROM legs WHERE ticket_id = ?').all(ticketId);
+      const legs = await db.prepare('SELECT * FROM legs WHERE ticket_id = ?').all(ticketId);
       const out = [];
       for (const leg of legs) {
         const prop = parseProp(leg);
@@ -1161,9 +1200,9 @@ const server = http.createServer(async (req, res) => {
     /* ---- board ---- */
     if (p === '/api/board' && req.method === 'GET') {
       const date = url.searchParams.get('date') || etDateStr();
-      const plays = db.prepare('SELECT * FROM board_plays WHERE board_date = ? ORDER BY id').all(date)
+      const plays = (await db.prepare('SELECT * FROM board_plays WHERE board_date = ? ORDER BY id').all(date))
         .map((r) => ({ id: r.id, boardDate: r.board_date, league: r.league, play: r.play, market: r.market, odds: r.odds, tier: r.tier, edgeNote: r.edge_note, sportsbook: r.sportsbook, verified: !!r.verified, verifiedAt: r.verified_at }));
-      const dates = db.prepare('SELECT DISTINCT board_date FROM board_plays ORDER BY board_date DESC LIMIT 30').all().map((r) => r.board_date);
+      const dates = (await db.prepare('SELECT DISTINCT board_date FROM board_plays ORDER BY board_date DESC LIMIT 30').all()).map((r) => r.board_date);
       return sendJSON(res, 200, { date, plays, dates });
     }
     if (p === '/api/push/board' && req.method === 'POST') {
@@ -1175,7 +1214,7 @@ const server = http.createServer(async (req, res) => {
       const ins = db.prepare('INSERT OR IGNORE INTO board_plays (board_date, league, play, market, odds, tier, edge_note, sportsbook, verified, verified_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
       for (const pl of list) {
         if (!pl || !pl.play) continue;
-        const info = ins.run(date, String(pl.league || '').toUpperCase().slice(0, 20), String(pl.play).slice(0, 200), String(pl.market || '').slice(0, 80),
+        const info = await ins.run(date, String(pl.league || '').toUpperCase().slice(0, 20), String(pl.play).slice(0, 200), String(pl.market || '').slice(0, 80),
           pl.odds === null || pl.odds === undefined ? null : Math.round(Number(pl.odds)), pl.tier === 'watch' ? 'watch' : 'actionable',
           String(pl.edgeNote || '').slice(0, 300), String(pl.sportsbook || 'Hard Rock Bet').slice(0, 60), pl.verified ? 1 : 0,
           pl.verifiedAt || (pl.verified ? nowISO() : null), nowISO());
@@ -1190,140 +1229,140 @@ const server = http.createServer(async (req, res) => {
       if (!ref) return sendJSON(res, 400, { error: 'externalRef required for idempotent ticket push.' });
       // morning tickets attach to the first registered account (the owner's) — or the user named in the push
       let owner = null;
-      if (b.username) owner = db.prepare('SELECT * FROM users WHERE username = ?').get(String(b.username));
-      if (!owner) owner = db.prepare('SELECT * FROM users ORDER BY id LIMIT 1').get();
+      if (b.username) owner = await db.prepare('SELECT * FROM users WHERE username = ?').get(String(b.username));
+      if (!owner) owner = await db.prepare('SELECT * FROM users ORDER BY id LIMIT 1').get();
       if (!owner) return sendJSON(res, 409, { error: 'No account exists yet to own the pushed ticket.' });
-      const existing = db.prepare('SELECT id FROM tickets WHERE user_id = ? AND external_ref = ?').get(owner.id, ref);
+      const existing = await db.prepare('SELECT id FROM tickets WHERE user_id = ? AND external_ref = ?').get(owner.id, ref);
       if (existing) return sendJSON(res, 200, { ok: true, deduped: true, ticketId: existing.id });
       const legs = Array.isArray(b.legs) ? b.legs : [];
       if (!legs.length) return sendJSON(res, 400, { error: 'legs required.' });
       const notes = String(b.notes || 'Morning ticket — from today\'s Board').slice(0, 1000);
-      const info = db.prepare('INSERT INTO tickets (user_id, title, sportsbook, stake, notes, source, boosted_payout, status, external_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      const info = await db.prepare('INSERT INTO tickets (user_id, title, sportsbook, stake, notes, source, boosted_payout, status, external_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(owner.id, String(b.title || 'Morning ticket').slice(0, 120), String(b.sportsbook || 'Hard Rock Bet').slice(0, 60), Math.max(0, Number(b.stake) || 0), notes, 'morning', b.boostedPayout ? Number(b.boostedPayout) : parseBoostedPayout(notes), 'open', ref, nowISO());
       const ticketId = Number(info.lastInsertRowid);
       const ins = db.prepare('INSERT INTO legs (ticket_id, league, game_label, selection, market, line, odds, starts_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
       for (const l of legs) {
-        ins.run(ticketId, String(l.league || '').toUpperCase().slice(0, 20), String(l.gameLabel || '').slice(0, 120), String(l.selection || '').slice(0, 200), String(l.market || '').slice(0, 80), String(l.line || '').slice(0, 40), Math.round(Number(l.odds) || -110), String(l.startsAt || '').slice(0, 40), 'pending');
+        await ins.run(ticketId, String(l.league || '').toUpperCase().slice(0, 20), String(l.gameLabel || '').slice(0, 120), String(l.selection || '').slice(0, 200), String(l.market || '').slice(0, 80), String(l.line || '').slice(0, 40), Math.round(Number(l.odds) || -110), String(l.startsAt || '').slice(0, 40), 'pending');
       }
       return sendJSON(res, 201, { ok: true, ticketId });
     }
 
     /* ---- bankroll ---- */
     if (p === '/api/bankroll' && req.method === 'GET') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
       await settleAll();
-      return sendJSON(res, 200, bankrollFor(u.id));
+      return sendJSON(res, 200, await bankrollFor(u.id));
     }
 
     /* ---- community ---- */
     if (p === '/api/community' && req.method === 'GET') {
-      const u = currentUser(req);
-      return sendJSON(res, 200, communityJSON(u));
+      const u = await currentUser(req);
+      return sendJSON(res, 200, await communityJSON(u));
     }
     if (p === '/api/community/posts' && req.method === 'POST') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required to post.' });
       const b = await readBody(req);
       const body = String(b.body || '').trim().slice(0, 2000);
       if (!body) return sendJSON(res, 400, { error: 'Write something first.' });
-      const info = db.prepare('INSERT INTO community_posts (user_id, kind, body, ticket_id, created_at) VALUES (?, ?, ?, ?, ?)').run(u.id, 'discussion', body, null, nowISO());
+      const info = await db.prepare('INSERT INTO community_posts (user_id, kind, body, ticket_id, created_at) VALUES (?, ?, ?, ?, ?)').run(u.id, 'discussion', body, null, nowISO());
       return sendJSON(res, 201, { id: Number(info.lastInsertRowid) });
     }
     if (p === '/api/community/ticket' && req.method === 'POST') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required to post.' });
       const b = await readBody(req);
-      const t = db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?').get(Number(b.ticketId), u.id);
+      const t = await db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?').get(Number(b.ticketId), u.id);
       if (!t) return sendJSON(res, 404, { error: 'Ticket not found.' });
-      const dup = db.prepare('SELECT id FROM community_posts WHERE kind = ? AND ticket_id = ? AND user_id = ?').get('ticket', t.id, u.id);
+      const dup = await db.prepare('SELECT id FROM community_posts WHERE kind = ? AND ticket_id = ? AND user_id = ?').get('ticket', t.id, u.id);
       if (dup) return sendJSON(res, 200, { id: dup.id, deduped: true });
-      const info = db.prepare('INSERT INTO community_posts (user_id, kind, body, ticket_id, created_at) VALUES (?, ?, ?, ?, ?)').run(u.id, 'ticket', String(b.body || '').trim().slice(0, 2000), t.id, nowISO());
+      const info = await db.prepare('INSERT INTO community_posts (user_id, kind, body, ticket_id, created_at) VALUES (?, ?, ?, ?, ?)').run(u.id, 'ticket', String(b.body || '').trim().slice(0, 2000), t.id, nowISO());
       return sendJSON(res, 201, { id: Number(info.lastInsertRowid) });
     }
     const commentMatch = p.match(/^\/api\/community\/posts\/(\d+)\/comments$/);
     if (commentMatch && req.method === 'POST') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required to comment.' });
-      const post = db.prepare('SELECT * FROM community_posts WHERE id = ?').get(Number(commentMatch[1]));
+      const post = await db.prepare('SELECT * FROM community_posts WHERE id = ?').get(Number(commentMatch[1]));
       if (!post) return sendJSON(res, 404, { error: 'Post not found.' });
       const b = await readBody(req);
       const body = String(b.body || '').trim().slice(0, 1000);
       if (!body) return sendJSON(res, 400, { error: 'Write something first.' });
-      const info = db.prepare('INSERT INTO community_comments (post_id, user_id, body, created_at) VALUES (?, ?, ?, ?)').run(post.id, u.id, body, nowISO());
+      const info = await db.prepare('INSERT INTO community_comments (post_id, user_id, body, created_at) VALUES (?, ?, ?, ?)').run(post.id, u.id, body, nowISO());
       return sendJSON(res, 201, { id: Number(info.lastInsertRowid) });
     }
     const reactionMatch = p.match(/^\/api\/community\/posts\/(\d+)\/reactions$/);
     if (reactionMatch && req.method === 'POST') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required to react.' });
-      const post = db.prepare('SELECT * FROM community_posts WHERE id = ?').get(Number(reactionMatch[1]));
+      const post = await db.prepare('SELECT * FROM community_posts WHERE id = ?').get(Number(reactionMatch[1]));
       if (!post) return sendJSON(res, 404, { error: 'Post not found.' });
       const b = await readBody(req);
       const reaction = ['respect', 'tail', 'hot'].includes(b.reaction) ? b.reaction : null;
       if (!reaction) return sendJSON(res, 400, { error: 'Unknown reaction.' });
-      const existing = db.prepare('SELECT id FROM community_reactions WHERE post_id = ? AND user_id = ? AND reaction = ?').get(post.id, u.id, reaction);
-      if (existing) db.prepare('DELETE FROM community_reactions WHERE id = ?').run(existing.id);
-      else db.prepare('INSERT INTO community_reactions (post_id, user_id, reaction) VALUES (?, ?, ?)').run(post.id, u.id, reaction);
+      const existing = await db.prepare('SELECT id FROM community_reactions WHERE post_id = ? AND user_id = ? AND reaction = ?').get(post.id, u.id, reaction);
+      if (existing) await db.prepare('DELETE FROM community_reactions WHERE id = ?').run(existing.id);
+      else await db.prepare('INSERT INTO community_reactions (post_id, user_id, reaction) VALUES (?, ?, ?)').run(post.id, u.id, reaction);
       return sendJSON(res, 200, { ok: true, on: !existing });
     }
     const postDelMatch = p.match(/^\/api\/community\/posts\/(\d+)$/);
     if (postDelMatch && req.method === 'DELETE') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
-      const post = db.prepare('SELECT * FROM community_posts WHERE id = ? AND user_id = ?').get(Number(postDelMatch[1]), u.id);
+      const post = await db.prepare('SELECT * FROM community_posts WHERE id = ? AND user_id = ?').get(Number(postDelMatch[1]), u.id);
       if (!post) return sendJSON(res, 404, { error: 'Post not found.' });
-      db.prepare('DELETE FROM community_comments WHERE post_id = ?').run(post.id);
-      db.prepare('DELETE FROM community_reactions WHERE post_id = ?').run(post.id);
-      db.prepare('DELETE FROM community_posts WHERE id = ?').run(post.id);
+      await db.prepare('DELETE FROM community_comments WHERE post_id = ?').run(post.id);
+      await db.prepare('DELETE FROM community_reactions WHERE post_id = ?').run(post.id);
+      await db.prepare('DELETE FROM community_posts WHERE id = ?').run(post.id);
       return sendJSON(res, 200, { ok: true });
     }
 
     /* ---- alerts ---- */
     if (p === '/api/alerts' && req.method === 'GET') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
-      const rows = db.prepare('SELECT * FROM alerts WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(u.id);
-      const unread = db.prepare('SELECT COUNT(*) AS n FROM alerts WHERE user_id = ? AND is_read = 0 AND held_quietly = 0').get(u.id).n;
-      const subs = db.prepare('SELECT * FROM alert_subs WHERE user_id = ?').all(u.id)
+      const rows = await db.prepare('SELECT * FROM alerts WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(u.id);
+      const unread = (await db.prepare('SELECT COUNT(*) AS n FROM alerts WHERE user_id = ? AND is_read = 0 AND held_quietly = 0').get(u.id)).n;
+      const subs = (await db.prepare('SELECT * FROM alert_subs WHERE user_id = ?').all(u.id))
         .map((r) => ({ scope: r.scope, ticketId: r.ticket_id, eventId: r.event_id, on: !!r.on_flag }));
-      const { prefs, quietStart, quietEnd } = getPrefs(u.id);
+      const { prefs, quietStart, quietEnd } = await getPrefs(u.id);
       return sendJSON(res, 200, {
         alerts: rows.map((a) => ({ id: a.id, type: a.type, title: a.title, body: a.body, ticketId: a.ticket_id, eventId: a.event_id, heldQuietly: !!a.held_quietly, read: !!a.is_read, createdAt: a.created_at })),
         unread, subs, prefs, quietStart, quietEnd, types: ALERT_TYPES,
       });
     }
     if (p === '/api/alerts/read' && req.method === 'POST') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
       const b = await readBody(req);
-      db.prepare('UPDATE alerts SET is_read = 1 WHERE id = ? AND user_id = ?').run(Number(b.id), u.id);
+      await db.prepare('UPDATE alerts SET is_read = 1 WHERE id = ? AND user_id = ?').run(Number(b.id), u.id);
       return sendJSON(res, 200, { ok: true });
     }
     if (p === '/api/alerts/read-all' && req.method === 'POST') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
-      db.prepare('UPDATE alerts SET is_read = 1 WHERE user_id = ?').run(u.id);
+      await db.prepare('UPDATE alerts SET is_read = 1 WHERE user_id = ?').run(u.id);
       return sendJSON(res, 200, { ok: true });
     }
     if (p === '/api/alerts/prefs' && req.method === 'PUT') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
       const b = await readBody(req);
-      const cur = getPrefs(u.id);
+      const cur = await getPrefs(u.id);
       const prefs = { ...cur.prefs };
       for (const t of ALERT_TYPES) if (typeof b.prefs?.[t] === 'boolean') prefs[t] = b.prefs[t];
-      db.prepare('UPDATE alert_prefs SET prefs = ?, quiet_start = ?, quiet_end = ? WHERE user_id = ?')
+      await db.prepare('UPDATE alert_prefs SET prefs = ?, quiet_start = ?, quiet_end = ? WHERE user_id = ?')
         .run(JSON.stringify(prefs), String(b.quietStart ?? cur.quietStart).slice(0, 5), String(b.quietEnd ?? cur.quietEnd).slice(0, 5), u.id);
       return sendJSON(res, 200, { ok: true });
     }
     if (p === '/api/alerts/toggle' && req.method === 'POST') {
-      const u = currentUser(req);
+      const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
       const b = await readBody(req);
       const scope = b.scope === 'game' ? 'game' : 'ticket';
       const on = b.on === false ? 0 : 1;
-      db.prepare('INSERT INTO alert_subs (user_id, scope, ticket_id, event_id, on_flag) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, scope, ticket_id, event_id) DO UPDATE SET on_flag = excluded.on_flag')
+      await db.prepare('INSERT INTO alert_subs (user_id, scope, ticket_id, event_id, on_flag) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, scope, ticket_id, event_id) DO UPDATE SET on_flag = excluded.on_flag')
         .run(u.id, scope, scope === 'ticket' ? Number(b.ticketId) || null : null, scope === 'game' ? String(b.eventId || '') : null, on);
       return sendJSON(res, 200, { ok: true });
     }
@@ -1351,9 +1390,17 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Sweat With Wilk listening on http://localhost:${PORT}`);
-});
-setInterval(() => { settleAll().catch(() => {}); }, 60000);
-setInterval(() => { alertCycle().catch(() => {}); }, 30000);
-setTimeout(() => { settleAll().catch(() => {}); }, 3000);
+(async () => {
+  try {
+    await initDb();
+  } catch (e) {
+    console.error('Database init failed: ' + (e && e.message ? e.message : 'unknown'));
+    process.exit(1);
+  }
+  server.listen(PORT, () => {
+    console.log(`Sweat With Wilk listening on http://localhost:${PORT}`);
+  });
+  setInterval(() => { settleAll().catch(() => {}); }, 60000);
+  setInterval(() => { alertCycle().catch(() => {}); }, 30000);
+  setTimeout(() => { settleAll().catch(() => {}); }, 3000);
+})();
