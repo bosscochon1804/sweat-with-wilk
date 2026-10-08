@@ -202,6 +202,14 @@ function ticketCardHTML(t) {
       <button class="btn secondary small" onclick="postToCommunity(${t.id})">Post to Community</button>
       <button class="btn danger small" onclick="deleteTicket(${t.id})">Delete</button>
     </div>`;
+  const summary = t.legs && t.legs.length > 1 ? `<div style="border:1.5px solid var(--mint);border-radius:12px;padding:12px;margin-top:12px">
+      <div class="row between"><strong style="color:var(--mint)">🧾 THE WHOLE TICKET</strong><span class="small muted">${t.legs.length} legs</span></div>
+      ${t.legs.map((l) => `<div style="border-top:1px solid var(--line);padding:7px 0">
+        <div class="row between"><span class="sel">${esc(l.selection)}</span><span class="row" style="gap:6px"><strong style="color:var(--mint)">${fmtOdds(l.odds)}</strong>${legStatusPill(l)}</span></div>
+        <div class="small muted">${l.gameLabel ? esc(l.gameLabel) + ' · ' : ''}${esc(l.market)}${l.line ? ' · ' + esc(l.line) : ''} · ${esc(l.league)}</div>
+      </div>`).join('')}
+      <div class="small muted" style="margin-top:6px">Screenshot this block — every leg on one screen. The live sweat for each game is below.</div>
+    </div>` : '';
   const body = groups.map((g, gi) => {
     const blockId = `t${t.id}g${gi}`;
     const detail = g.eventId ? state.detailCache.get(String(g.eventId)) : null;
@@ -222,7 +230,7 @@ function ticketCardHTML(t) {
       ${detailTabsHTML(blockId, g.league, g.eventId)}
     </div>`;
   }).join('');
-  return `<div class="card">${head}${body}${t.notes ? `<div class="small muted" style="margin-top:10px">${esc(t.notes)}</div>` : ''}${t.hasImage ? `<img class="ticket-img" src="/api/tickets/${t.id}/image" alt="Ticket screenshot">` : ''}</div>`;
+  return `<div class="card">${head}${summary}${body}${t.notes ? `<div class="small muted" style="margin-top:10px">${esc(t.notes)}</div>` : ''}${t.hasImage ? `<img class="ticket-img" src="/api/tickets/${t.id}/image" alt="Ticket screenshot">` : ''}</div>`;
 }
 async function renderTickets() {
   const el = $('#view-tickets');
