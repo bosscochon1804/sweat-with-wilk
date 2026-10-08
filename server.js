@@ -1258,6 +1258,52 @@ const server = http.createServer(async (req, res) => {
       }
       return sendJSON(res, 200, { props: out });
     }
+    if (p === '/api/props/mine' && req.method === 'GET') {
+      const u = await currentUser(req);
+      if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
+      const tickets = await db.prepare("SELECT * FROM tickets WHERE user_id = ? AND status = 'open' ORDER BY id DESC").all(u.id);
+      const out = [];
+      const gamesCache = {};
+      for (const t of tickets) {
+        const legs = await db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(t.id);
+        for (const leg of legs) {
+          const prop = parseProp(leg);
+          if (!prop) continue;
+          if (!gamesCache[leg.league]) gamesCache[leg.league] = await gamesForLeague(leg.league);
+          const game = matchGameForLeg(leg, gamesCache[leg.league]);
+          const pv = await propCurrentValue(leg, game);
+          let statusText = 'Player stat not available in feed';
+          let progress = null, remaining = null;
+          if (pv && pv.available) {
+            statusText = '';
+            const line = pv.prop.line;
+            if (pv.prop.stat === 'anytime_td') {
+              progress = pv.value >= 1 ? 100 : 0;
+              remaining = pv.value >= 1 ? 'Cashed' : 'Needs a touchdown';
+            } else if (line) {
+              progress = Math.max(0, Math.min(100, Math.round((pv.value / line) * 100)));
+              if (pv.prop.dir === 'under') {
+                remaining = `Room left: ${Math.max(0, money(line - pv.value))}`;
+                progress = Math.max(0, Math.min(100, Math.round((1 - pv.value / (line + 1)) * 100)));
+              } else {
+                remaining = pv.value >= line ? 'Line crossed' : `${money(line - pv.value)} to go`;
+              }
+            }
+          }
+          out.push({
+            ticketId: t.id, ticketTitle: t.title || '', legId: leg.id, selection: leg.selection,
+            player: pv ? pv.prop.player : prop.player, statLabel: pv ? pv.prop.statLabel : prop.statLabel,
+            dir: pv ? pv.prop.dir : prop.dir, line: pv ? pv.prop.line : prop.line, value: pv ? pv.value : null,
+            available: pv ? pv.available : false,
+            display: pv && pv.available && pv.prop.line !== null ? `${pv.value} / ${pv.prop.line} (${pv.prop.dir === 'under' ? 'Under' : 'Over'})` : null,
+            progress, remaining, statusText, legStatus: leg.status, odds: leg.odds,
+            gameLabel: leg.game_label, league: leg.league, startsAt: leg.starts_at,
+            gameState: game ? game.state : null, gameDetail: game ? game.detail : '',
+          });
+        }
+      }
+      return sendJSON(res, 200, { props: out });
+    }
 
     /* ---- board ---- */
     if (p === '/api/board' && req.method === 'GET') {

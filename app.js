@@ -60,7 +60,7 @@ async function refreshAlertBadge() {
 }
 function render() {
   refreshAlertBadge();
-  ({ tickets: renderTickets, scores: renderScores, news: renderNews, community: renderCommunity, board: renderBoard, bankroll: renderBankroll, account: renderAccount })[state.view]();
+  ({ tickets: renderTickets, scores: renderScores, props: renderProps, news: renderNews, community: renderCommunity, board: renderBoard, bankroll: renderBankroll, account: renderAccount })[state.view]();
 }
 
 /* ================= TICKETS ================= */
@@ -593,6 +593,52 @@ async function renderScores() {
 function setScoresLeague(l) { state.scoresLeague = l; renderScores(); }
 
 /* ================= NEWS ================= */
+/* ================= PROPS ================= */
+function isBoardPropPlay(pl) {
+  const m = (pl.market || '').toLowerCase();
+  if (m.includes('prop') || m.includes('player')) return true;
+  const t = (pl.play || '').toLowerCase();
+  return /\b(over|under)\s+\d/.test(t) && /(yard|reception|point|rebound|assist|strikeout|hits|goal|shot|touchdown|passing|rushing|receiving|threes|blocks|steals|saves)/.test(t);
+}
+async function renderProps() {
+  const el = $('#view-props');
+  el.innerHTML = `<h2>Player Props</h2><div id="props-body"><div class="empty">Loading props…</div></div>`;
+  const body = () => $('#props-body');
+  try {
+    let mine = [];
+    if (state.user) {
+      const d = await api('GET', '/api/props/mine');
+      mine = d.props || [];
+    }
+    let boardProps = [];
+    let boardDate = '';
+    try {
+      const b = await api('GET', '/api/board');
+      boardDate = b.date;
+      boardProps = (b.plays || []).filter(isBoardPropPlay);
+    } catch { /* board section just stays empty */ }
+    const myCard = (p) => `<div class="card tight">
+      <div class="row between"><strong>${esc(p.player || p.selection)}</strong><span class="pill ${p.legStatus === 'won' ? 'won' : p.legStatus === 'lost' ? 'lost' : 'pending'}">${esc(p.legStatus)}</span></div>
+      <div class="small muted">${esc(p.statLabel || '')}${p.line !== null && p.line !== undefined ? ` · ${p.dir === 'under' ? 'Under' : 'Over'} ${p.line}` : ''} · ${fmtOdds(p.odds)} · ${esc(p.league)}</div>
+      <div class="small muted">${esc(p.gameLabel || '')}${p.gameState === 'in' ? ` · <span style="color:var(--red)">LIVE</span> ${esc(p.gameDetail || '')}` : p.gameState === 'post' ? ' · Final' : p.startsAt ? ' · ' + fmtDateTime(p.startsAt) : ''}</div>
+      ${p.available ? `<div class="small" style="margin-top:5px"><strong>${esc(p.display || '')}</strong>${p.progress !== null && p.progress !== undefined ? `<div class="propbar"><div style="width:${p.progress}%"></div></div>` : ''}<span class="muted">${esc(p.remaining || '')}</span></div>` : `<div class="small muted" style="margin-top:5px">${esc(p.statusText || '')}</div>`}
+      <div class="small muted" style="margin-top:4px">On: ${esc(p.ticketTitle || 'a ticket')}</div>
+    </div>`;
+    const boardCard = (pl) => `<div class="card tight"><div class="row between"><strong>${esc(pl.play)}</strong><span>${pl.odds !== null && pl.odds !== undefined ? fmtOdds(pl.odds) : ''}</span></div>
+      <div class="small muted">${esc(pl.league)}${pl.market ? ' · ' + esc(pl.market) : ''} · ${esc(pl.sportsbook)}${pl.tier !== 'watch' ? ' · <span style="color:var(--mint)">Actionable</span>' : ' · Watch'}</div>
+      ${pl.edgeNote ? `<div class="small" style="margin-top:4px">${esc(pl.edgeNote)}</div>` : ''}
+      ${pl.verified ? `<div class="small" style="color:var(--mint);margin-top:4px">✓ Verified on Hard Rock Bet${pl.verifiedAt ? ' · ' + fmtDateTime(pl.verifiedAt) : ''}</div>` : ''}</div>`;
+    body().innerHTML = `
+      <h3>Your props — live</h3>
+      ${!state.user ? `<div class="card"><div class="empty">Sign in to sweat your prop legs here.<br><button class="btn" style="margin-top:8px" onclick="showView('account')">Sign in</button></div></div>`
+        : mine.length ? mine.map(myCard).join('') : `<div class="card"><div class="empty">No player props on your open tickets right now.<br>Any ticket you add with a player prop leg — screenshot or typed — sweats here live with a progress bar.</div></div>`}
+      <h3 style="margin-top:18px">Today's prop plays — from the Board${boardDate ? ` · ${fmtDay(boardDate)}` : ''}</h3>
+      ${boardProps.length ? boardProps.map(boardCard).join('') : `<div class="card"><div class="empty">No player props on today's Board — today was all sides and totals.<br>When the morning Board carries props, they land here with the verified Hard Rock line.</div></div>`}`;
+  } catch (e) {
+    body().innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
+}
+
 async function renderNews() {
   const el = $('#view-news');
   if (!$('#news-list')) {
