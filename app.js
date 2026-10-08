@@ -342,11 +342,31 @@ function openAddTicket() {
     if (!f) return;
     const reader = new FileReader();
     reader.onload = async () => {
-      pendingImageDataUrl = reader.result;
+      // Downscale + re-encode to JPEG before OCR/upload: full-res phone screenshots
+      // are multi-MB PNGs that make the attach step slow and fragile on cellular.
+      pendingImageDataUrl = await downscaleImage(reader.result).catch(() => reader.result);
       const img = $('#ticket-preview'); img.src = pendingImageDataUrl; img.style.display = 'block';
       runOcr(pendingImageDataUrl);
     };
     reader.readAsDataURL(f);
+  });
+}
+function downscaleImage(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const maxDim = 1280;
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        if (scale >= 1 && String(dataUrl).startsWith('data:image/jpeg')) return resolve(dataUrl);
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        resolve(c.toDataURL('image/jpeg', 0.85));
+      } catch (e) { reject(e); }
+    };
+    img.onerror = reject;
+    img.src = dataUrl;
   });
 }
 function addTicketTab(which) {
@@ -522,12 +542,17 @@ async function saveTicket() {
       boostedPayout: parseFloat($('#tf-boosted').value) || null,
       source: pendingImageDataUrl ? 'screenshot' : 'manual', legs,
     });
+    let imageFailed = false;
     if (pendingImageDataUrl) {
-      await api('POST', `/api/tickets/${d.ticket.id}/image`, { dataUrl: pendingImageDataUrl });
+      // The ticket is already saved at this point — a failed photo attach must
+      // never make the save look failed. Attach best-effort, then close either way.
+      try { await api('POST', `/api/tickets/${d.ticket.id}/image`, { dataUrl: pendingImageDataUrl }); }
+      catch { imageFailed = true; }
     }
     closeSheet();
     await loadTickets();
     showView('tickets');
+    if (imageFailed) alert('Ticket saved — but the screenshot could not be attached. The ticket itself is in your list.');
   } catch (e) { err.innerHTML = `<div class="err" style="margin-top:10px">${esc(e.message)}</div>`; }
 }
 
