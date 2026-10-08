@@ -474,26 +474,63 @@ function teamTokenHit(team, textTokens) {
   for (const t of nameToks) if (textTokens.includes(t)) hits++;
   return { hits, nickHit: nick && textTokens.includes(nick), abbrHit: abbr.length >= 2 && textTokens.includes(abbr) };
 }
-/* A game matches a leg ONLY when BOTH teams hit (never a single team). */
+/* ET offset (ms) for a UTC instant — used to read naive ET leg times. */
+function etOffsetMs(utcDate) {
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).formatToParts(utcDate);
+  const p = {};
+  for (const x of parts) p[x.type] = x.value;
+  const wallAsUTC = Date.UTC(+p.year, +p.month - 1, +p.day, (+p.hour) % 24, +p.minute, +p.second);
+  return wallAsUTC - Math.floor(utcDate.getTime() / 1000) * 1000;
+}
+/* Leg starts_at is stored as a naive ET wall time ("2026-10-08T20:00") — convert to a UTC ms. */
+function legStartMs(leg) {
+  const s = String((leg && leg.starts_at) || '');
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+  if (!m) return null;
+  const wallAsUTC = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
+  return wallAsUTC - etOffsetMs(new Date(wallAsUTC));
+}
+/* A game matches a leg ONLY when BOTH teams hit (never a single team).
+   When the same two teams meet more than once in the window (a series), the leg's
+   own start date decides — a saved event_id never outranks the leg's date. */
 function matchGameForLeg(leg, games) {
-  if (leg.event_id) {
-    const g = games.find((x) => x.id === String(leg.event_id));
-    if (g) return g;
-  }
   const text = `${leg.game_label || ''} ${leg.selection || ''}`;
   const tt = tokens(text);
-  let best = null;
+  const candidates = [];
   for (const g of games) {
     const a = teamTokenHit(g.away, tt);
     const h = teamTokenHit(g.home, tt);
     const awayOk = a.nickHit || a.hits >= 2 || a.abbrHit;
     const homeOk = h.nickHit || h.hits >= 2 || h.abbrHit;
-    if (awayOk && homeOk) {
-      const score = a.hits + h.hits;
-      if (!best || score > best.score) best = { game: g, score };
-    }
+    if (awayOk && homeOk) candidates.push({ game: g, score: a.hits + h.hits });
   }
-  return best ? best.game : null;
+  if (!candidates.length) return null;
+  const legMs = legStartMs(leg);
+  if (legMs !== null) {
+    const legEtDate = String(leg.starts_at).slice(0, 10);
+    candidates.sort((x, y) => {
+      const xSameDay = etDateStr(new Date(x.game.date)) === legEtDate ? 0 : 1;
+      const ySameDay = etDateStr(new Date(y.game.date)) === legEtDate ? 0 : 1;
+      if (xSameDay !== ySameDay) return xSameDay - ySameDay;
+      const xDiff = Math.abs(new Date(x.game.date).getTime() - legMs);
+      const yDiff = Math.abs(new Date(y.game.date).getTime() - legMs);
+      if (xDiff !== yDiff) return xDiff - yDiff;
+      return y.score - x.score;
+    });
+    return candidates[0].game;
+  }
+  if (leg.event_id) {
+    const saved = candidates.find((c) => String(c.game.id) === String(leg.event_id));
+    if (saved && (saved.game.state !== 'post' || !candidates.some((c) => c.game.state !== 'post'))) return saved.game;
+  }
+  const stateRank = (s) => (s === 'in' ? 0 : s === 'pre' ? 1 : 2);
+  candidates.sort((x, y) => {
+    const r = stateRank(x.game.state) - stateRank(y.game.state);
+    if (r !== 0) return r;
+    if (y.score !== x.score) return y.score - x.score;
+    return new Date(y.game.date).getTime() - new Date(x.game.date).getTime();
+  });
+  return candidates[0].game;
 }
 function pickTeam(leg, game) {
   // The SELECTION names the side — the game label names both teams (it's the matchup),
@@ -719,11 +756,27 @@ function parseBoostedPayout(notes) {
 async function settleTicket(ticket) {
   const legs = await db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(ticket.id);
   let changed = false;
-  const leaguesNeeded = [...new Set(legs.filter((l) => l.status === 'pending' || l.status === 'live').map((l) => l.league))];
+  const leaguesNeeded = [...new Set(legs.filter((l) => l.status === 'pending' || l.status === 'live' || (l.event_id && l.starts_at)).map((l) => l.league))];
   const leagueGames = {};
   for (const lg of leaguesNeeded) leagueGames[lg] = await gamesForLeague(lg);
   for (const leg of legs) {
-    if (['won', 'lost', 'push'].includes(leg.status)) continue;
+    if (['won', 'lost', 'push'].includes(leg.status)) {
+      // Heal a leg graded off the WRONG game (same two teams, different day): if its
+      // saved event falls on a different ET date than the leg's own start and the
+      // matcher now finds the right game, reset the leg so it re-grades correctly.
+      if (leg.event_id && leg.starts_at) {
+        const games0 = leagueGames[leg.league] || [];
+        const saved = games0.find((g) => String(g.id) === String(leg.event_id));
+        if (saved && etDateStr(new Date(saved.date)) !== String(leg.starts_at).slice(0, 10)) {
+          const right = matchGameForLeg(leg, games0);
+          if (right && String(right.id) !== String(leg.event_id)) {
+            await db.prepare("UPDATE legs SET status = 'pending', event_id = NULL, final_value = NULL WHERE id = ?").run(leg.id);
+            leg.status = 'pending'; leg.event_id = null; leg.final_value = null; changed = true;
+          }
+        }
+      }
+      if (['won', 'lost', 'push'].includes(leg.status)) continue;
+    }
     const games = leagueGames[leg.league] || [];
     const game = matchGameForLeg(leg, games);
     if (!game) continue;
