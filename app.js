@@ -359,20 +359,118 @@ function addLegRow(leg) {
   const wrap = $('#legs-wrap');
   wrap.insertAdjacentHTML('beforeend', legRowHTML(leg));
 }
+/* ---- Hard Rock slip parser: turns OCR text into leg rows (review-first) ---- */
+const TEAM_BOOK = [
+  // NFL
+  ['Cardinals','Arizona Cardinals','NFL'],['Falcons','Atlanta Falcons','NFL'],['Ravens','Baltimore Ravens','NFL'],['Bills','Buffalo Bills','NFL'],['Panthers','Carolina Panthers','NFL'],['Bears','Chicago Bears','NFL'],['Bengals','Cincinnati Bengals','NFL'],['Browns','Cleveland Browns','NFL'],['Cowboys','Dallas Cowboys','NFL'],['Broncos','Denver Broncos','NFL'],['Lions','Detroit Lions','NFL'],['Packers','Green Bay Packers','NFL'],['Texans','Houston Texans','NFL'],['Colts','Indianapolis Colts','NFL'],['Jaguars','Jacksonville Jaguars','NFL'],['Chiefs','Kansas City Chiefs','NFL'],['Raiders','Las Vegas Raiders','NFL'],['Chargers','Los Angeles Chargers','NFL'],['Rams','Los Angeles Rams','NFL'],['Dolphins','Miami Dolphins','NFL'],['Vikings','Minnesota Vikings','NFL'],['Patriots','New England Patriots','NFL'],['Saints','New Orleans Saints','NFL'],['Giants','New York Giants','NFL'],['Jets','New York Jets','NFL'],['Eagles','Philadelphia Eagles','NFL'],['Steelers','Pittsburgh Steelers','NFL'],['49ers','San Francisco 49ers','NFL'],['Seahawks','Seattle Seahawks','NFL'],['Buccaneers','Tampa Bay Buccaneers','NFL'],['Titans','Tennessee Titans','NFL'],['Commanders','Washington Commanders','NFL'],
+  // MLB
+  ['Diamondbacks','Arizona Diamondbacks','MLB'],['Braves','Atlanta Braves','MLB'],['Orioles','Baltimore Orioles','MLB'],['Red Sox','Boston Red Sox','MLB'],['Cubs','Chicago Cubs','MLB'],['White Sox','Chicago White Sox','MLB'],['Reds','Cincinnati Reds','MLB'],['Guardians','Cleveland Guardians','MLB'],['Rockies','Colorado Rockies','MLB'],['Tigers','Detroit Tigers','MLB'],['Astros','Houston Astros','MLB'],['Royals','Kansas City Royals','MLB'],['Angels','Los Angeles Angels','MLB'],['Dodgers','Los Angeles Dodgers','MLB'],['Marlins','Miami Marlins','MLB'],['Brewers','Milwaukee Brewers','MLB'],['Twins','Minnesota Twins','MLB'],['Mets','New York Mets','MLB'],['Yankees','New York Yankees','MLB'],['Athletics','Athletics','MLB'],['Phillies','Philadelphia Phillies','MLB'],['Pirates','Pittsburgh Pirates','MLB'],['Padres','San Diego Padres','MLB'],['Giants','San Francisco Giants','MLB'],['Mariners','Seattle Mariners','MLB'],['Cardinals','St. Louis Cardinals','MLB'],['Rays','Tampa Bay Rays','MLB'],['Rangers','Texas Rangers','MLB'],['Blue Jays','Toronto Blue Jays','MLB'],['Nationals','Washington Nationals','MLB'],
+  // NHL
+  ['Ducks','Anaheim Ducks','NHL'],['Bruins','Boston Bruins','NHL'],['Sabres','Buffalo Sabres','NHL'],['Flames','Calgary Flames','NHL'],['Hurricanes','Carolina Hurricanes','NHL'],['Blackhawks','Chicago Blackhawks','NHL'],['Avalanche','Colorado Avalanche','NHL'],['Blue Jackets','Columbus Blue Jackets','NHL'],['Stars','Dallas Stars','NHL'],['Red Wings','Detroit Red Wings','NHL'],['Oilers','Edmonton Oilers','NHL'],['Panthers','Florida Panthers','NHL'],['Kings','Los Angeles Kings','NHL'],['Wild','Minnesota Wild','NHL'],['Canadiens','Montreal Canadiens','NHL'],['Predators','Nashville Predators','NHL'],['Devils','New Jersey Devils','NHL'],['Islanders','New York Islanders','NHL'],['Rangers','New York Rangers','NHL'],['Senators','Ottawa Senators','NHL'],['Flyers','Philadelphia Flyers','NHL'],['Penguins','Pittsburgh Penguins','NHL'],['Sharks','San Jose Sharks','NHL'],['Kraken','Seattle Kraken','NHL'],['Blues','St. Louis Blues','NHL'],['Lightning','Tampa Bay Lightning','NHL'],['Maple Leafs','Toronto Maple Leafs','NHL'],['Mammoth','Utah Mammoth','NHL'],['Canucks','Vancouver Canucks','NHL'],['Golden Knights','Vegas Golden Knights','NHL'],['Capitals','Washington Capitals','NHL'],['Jets','Winnipeg Jets','NHL'],
+  // NBA
+  ['Hawks','Atlanta Hawks','NBA'],['Celtics','Boston Celtics','NBA'],['Nets','Brooklyn Nets','NBA'],['Hornets','Charlotte Hornets','NBA'],['Bulls','Chicago Bulls','NBA'],['Cavaliers','Cleveland Cavaliers','NBA'],['Mavericks','Dallas Mavericks','NBA'],['Nuggets','Denver Nuggets','NBA'],['Pistons','Detroit Pistons','NBA'],['Warriors','Golden State Warriors','NBA'],['Rockets','Houston Rockets','NBA'],['Pacers','Indiana Pacers','NBA'],['Clippers','Los Angeles Clippers','NBA'],['Lakers','Los Angeles Lakers','NBA'],['Grizzlies','Memphis Grizzlies','NBA'],['Heat','Miami Heat','NBA'],['Bucks','Milwaukee Bucks','NBA'],['Timberwolves','Minnesota Timberwolves','NBA'],['Pelicans','New Orleans Pelicans','NBA'],['Knicks','New York Knicks','NBA'],['Thunder','Oklahoma City Thunder','NBA'],['Magic','Orlando Magic','NBA'],['76ers','Philadelphia 76ers','NBA'],['Suns','Phoenix Suns','NBA'],['Trail Blazers','Portland Trail Blazers','NBA'],['Kings','Sacramento Kings','NBA'],['Spurs','San Antonio Spurs','NBA'],['Raptors','Toronto Raptors','NBA'],['Jazz','Utah Jazz','NBA'],['Wizards','Washington Wizards','NBA'],
+];
+const COLLEGE_TOKENS = ['UTSA','South Florida','UCF','FAU','FIU','Miami','Florida State','Florida','Georgia','Alabama','Texas','Ohio State','Michigan','LSU','Tennessee','Oklahoma','Notre Dame','Clemson','Penn State','Oregon','USC','UCLA','Auburn','Texas A&M','Ole Miss','Arkansas','Kentucky','South Carolina','Mississippi State','Vanderbilt','Missouri','Iowa','Wisconsin','Nebraska','Illinois','Indiana','Purdue','Michigan State','Rutgers','Maryland','Northwestern','Minnesota','Washington','Utah','Arizona','Arizona State','Colorado','BYU','Kansas','Kansas State','Iowa State','TCU','Baylor','Texas Tech','Houston','Cincinnati','West Virginia','Oklahoma State','Syracuse','Pittsburgh','Louisville','NC State','Duke','North Carolina','Virginia','Virginia Tech','Georgia Tech','Wake Forest','Boston College','Stanford','California','SMU','Memphis','Tulane','Boise State','Fresno State','San Diego State','UNLV','Air Force','Army','Navy','Liberty','App State','Coastal Carolina','Marshall','Troy','Louisiana','Georgia Southern','Old Dominion','Western Kentucky','Middle Tennessee','UTEP','New Mexico State','Sam Houston','Jacksonville State','Kennesaw State','Delaware','Missouri State'];
+function lookupTeam(name) {
+  const n = (name || '').trim();
+  if (!n) return null;
+  // exact full-name or nickname match, longest nickname wins
+  let best = null;
+  for (const [nick, full, league] of TEAM_BOOK) {
+    if (n === full || n === nick || n.endsWith(' ' + nick) || n.endsWith(nick)) {
+      if (!best || nick.length > best[0].length) best = [nick, full, league];
+    }
+  }
+  if (best) return { full: best[1], league: best[2] };
+  if (COLLEGE_TOKENS.some((c) => n === c || n.startsWith(c + ' ') || n.endsWith(' ' + c))) return { full: n, league: 'NCAAF' };
+  return null;
+}
+function parseStartTime(text) {
+  const tm = text.match(/(\d{1,2}):(\d{2})\s*(am|pm)/i);
+  if (!tm) return '';
+  let h = parseInt(tm[1], 10);
+  const ap = tm[3].toLowerCase();
+  if (ap === 'pm' && h !== 12) h += 12;
+  if (ap === 'am' && h === 12) h = 0;
+  const now = new Date();
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (/tomorrow/i.test(text)) d.setDate(d.getDate() + 1);
+  const md = text.match(/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})/i);
+  if (md) { const months = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 }; d.setMonth(months[md[1].slice(0,3).toLowerCase()]); d.setDate(parseInt(md[2], 10)); }
+  const p2 = (x) => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(h)}:${tm[2]}`;
+}
+function parseSlipText(raw) {
+  const lines = raw.split('\n').map((s) => s.replace(/^[^A-Za-z0-9+$-]+/, '').trim()).filter(Boolean);
+  const legs = [];
+  const oddsAtEnd = /^(.+?)\s+([+-]\d{3,4})$/;
+  const oddsOnly = /^([+-]\d{3,4})$/;
+  const isHeader = (t) => /parlay|payout|wager|hide selections|track on lock|my bets/i.test(t);
+  for (let i = 0; i < lines.length; i++) {
+    let selText = null, odds = null;
+    let m = lines[i].match(oddsAtEnd);
+    if (m && !isHeader(m[1])) { selText = m[1].trim(); odds = parseInt(m[2], 10); }
+    else if (oddsOnly.test(lines[i]) && i > 0 && !oddsAtEnd.test(lines[i - 1])) { selText = lines[i - 1]; odds = parseInt(lines[i], 10); }
+    if (selText === null || odds === null || Number.isNaN(odds)) continue;
+    if (/^\d+\s*-?\s*bet/i.test(selText)) continue;
+    // gather context from the next few lines
+    let market = '', gameLabel = '', startsAt = '';
+    for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+      const L = lines[j];
+      if (oddsAtEnd.test(L) || oddsOnly.test(L)) break;
+      if (/^to win$/i.test(L) || /moneyline/i.test(L)) market = 'Moneyline';
+      else if (/spread/i.test(L)) market = 'Spread';
+      else if (/^(over|under|total)/i.test(L)) market = 'Total';
+      if (L.includes('@')) gameLabel = L.replace(/\s+/g, ' ');
+      if (/:\d{2}\s*(am|pm)/i.test(L)) startsAt = parseStartTime(L);
+    }
+    if (!market && !gameLabel) continue; // not a leg block — likely the parlay header
+    // split a trailing spread/total line off the selection ("UTSA -6.5", "Over 47.5")
+    let line = '';
+    const lm = selText.match(/^(.+?)\s+([+-]\d+(?:\.\d+)?)$/);
+    if (lm) { selText = lm[1].trim(); line = lm[2]; if (!market) market = /^(over|under)$/i.test(selText) ? 'Total' : 'Spread'; }
+    if (!market) market = 'Moneyline';
+    const selTeam = lookupTeam(selText);
+    let selection = selText;
+    if (selTeam) selection = selTeam.full;
+    if (market === 'Moneyline' && selTeam) selection = selTeam.full + ' ML';
+    if (market === 'Spread' && line) selection = selection + ' ' + line;
+    if (market === 'Total' && line) selection = selText + ' ' + line;
+    // expand matchup team names
+    let league = selTeam ? selTeam.league : '';
+    if (gameLabel.includes('@')) {
+      const [a, b] = gameLabel.split('@').map((s) => s.trim());
+      const ta = lookupTeam(a), tb = lookupTeam(b);
+      gameLabel = `${ta ? ta.full : a} @ ${tb ? tb.full : b}`;
+      if (!league) league = (ta && ta.league) || (tb && tb.league) || '';
+    }
+    legs.push({ league: league || 'NFL', market, gameLabel, selection, line, odds, startsAt });
+  }
+  // stake: first $ amount on a line that is not the payout line
+  let stake = '';
+  for (const L of lines) { if (/payout/i.test(L)) continue; const sm = L.match(/\$\s?(\d+(?:\.\d{2})?)/); if (sm) { stake = sm[1]; break; } }
+  const idm = raw.match(/ID:?\s*(\d{8,})/i);
+  return { legs, stake, slipId: idm ? idm[1] : '' };
+}
 async function runOcr(dataUrl) {
   const status = $('#ocr-status');
   if (!window.Tesseract) { status.textContent = 'OCR is unavailable right now — the screenshot will attach; type the legs below.'; return; }
-  status.textContent = 'Reading your ticket (best effort)…';
+  status.textContent = 'Reading your ticket…';
   try {
     const { data } = await Tesseract.recognize(dataUrl, 'eng');
     pendingOcrText = data.text || '';
-    const lines = pendingOcrText.split('\n').map((s) => s.trim()).filter(Boolean);
-    // best-effort prefill: find stake like $5.00 and odds-like tokens per line
-    const stakeMatch = pendingOcrText.match(/\$\s?(\d+(?:\.\d{2})?)/);
-    if (stakeMatch && !$('#tf-stake').value) $('#tf-stake').value = stakeMatch[1];
-    status.textContent = 'Read finished — check the legs below and fix anything wrong before saving. Raw text was added to Notes.';
+    const parsed = parseSlipText(pendingOcrText);
+    if (parsed.stake && !$('#tf-stake').value) $('#tf-stake').value = parsed.stake;
     const notes = $('#tf-notes');
-    if (!notes.value) notes.value = pendingOcrText.slice(0, 400);
+    if (parsed.legs.length) {
+      $('#legs-wrap').innerHTML = '';
+      parsed.legs.forEach((leg) => addLegRow(leg));
+      if (parsed.slipId && !notes.value) notes.value = `Hard Rock Bet slip ${parsed.slipId}`;
+      status.textContent = `Read ${parsed.legs.length} leg${parsed.legs.length > 1 ? 's' : ''} from your screenshot — check each one below and fix anything wrong before saving.`;
+    } else {
+      if (!notes.value) notes.value = pendingOcrText.slice(0, 400);
+      status.textContent = 'Read finished, but no legs could be picked out — the raw text was added to Notes. Type the legs below; the screenshot still attaches.';
+    }
   } catch {
     status.textContent = 'Could not read this screenshot — it will still attach; type the legs below.';
   }
