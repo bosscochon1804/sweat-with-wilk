@@ -194,6 +194,15 @@ function sendJSON(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(body);
 }
+function cleanDeep(v) {
+  // Repair unpaired surrogates + strip control chars: pasted text (e.g. an emoji
+  // mangled by copy/paste) can carry a lone surrogate, which the database rejects
+  // with an opaque HTTP 400. Sanitize every JSON body at the door.
+  if (typeof v === 'string') return v.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  if (Array.isArray(v)) return v.map(cleanDeep);
+  if (v && typeof v === 'object') { for (const k of Object.keys(v)) v[k] = cleanDeep(v[k]); }
+  return v;
+}
 function readBody(req, limitBytes = 12 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -206,7 +215,7 @@ function readBody(req, limitBytes = 12 * 1024 * 1024) {
     req.on('end', () => {
       const raw = Buffer.concat(chunks).toString('utf8');
       if (!raw) return resolve({});
-      try { resolve(JSON.parse(raw)); } catch { reject(new Error('invalid json')); }
+      try { resolve(cleanDeep(JSON.parse(raw))); } catch { reject(new Error('invalid json')); }
     });
     req.on('error', reject);
   });
