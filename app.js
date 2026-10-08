@@ -441,16 +441,43 @@ function parseSlipText(raw) {
     if (gameLabel.includes('@')) {
       const [a, b] = gameLabel.split('@').map((s) => s.trim());
       const ta = lookupTeam(a), tb = lookupTeam(b);
-      gameLabel = `${ta ? ta.full : a} @ ${tb ? tb.full : b}`;
+      // OCR garbage lines (nav bars, icon rows) can contain '@' — if neither side
+      // resolves to any known team and the line has junk symbols, leave it blank.
+      if (!ta && !tb && /[&•|]/.test(gameLabel)) gameLabel = '';
+      else gameLabel = `${ta ? ta.full : a} @ ${tb ? tb.full : b}`;
       if (!league) league = (ta && ta.league) || (tb && tb.league) || '';
     }
     legs.push({ league: league || 'NFL', market, gameLabel, selection, line, odds, startsAt });
   }
-  // stake: first $ amount on a line that is not the payout line
+  // Salvage pass: a leg whose odds OCR garbled (e.g. "Golden Knights 0)") still
+  // shows up with a blank odds field for review instead of vanishing entirely.
+  for (let i = 0; i < lines.length; i++) {
+    const L = lines[i];
+    if (L.includes('@') || oddsAtEnd.test(L) || oddsOnly.test(L) || isHeader(L)) continue;
+    const words = L.split(/\s+/);
+    let team = null;
+    for (let k = words.length; k >= 1; k--) { const t = lookupTeam(words.slice(0, k).join(' ')); if (t) { team = t; break; } }
+    if (!team) continue;
+    if (legs.some((l) => l.selection.startsWith(team.full))) continue;
+    let market = '', gameLabel = '', startsAt = '';
+    for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+      const X = lines[j];
+      if (/^to win$/i.test(X) || /moneyline/i.test(X)) market = 'Moneyline';
+      else if (/spread/i.test(X)) market = 'Spread';
+      else if (/^(over|under|total)/i.test(X)) market = 'Total';
+      if (X.includes('@')) { const [a, b] = X.split('@').map((s) => s.trim()); const ta = lookupTeam(a), tb = lookupTeam(b); if (ta || tb) gameLabel = `${ta ? ta.full : a} @ ${tb ? tb.full : b}`; }
+      if (/:\d{2}\s*(am|pm)/i.test(X)) startsAt = parseStartTime(X);
+    }
+    if (market && gameLabel) legs.push({ league: team.league, market, gameLabel, selection: market === 'Moneyline' ? team.full + ' ML' : team.full, line: '', odds: '', startsAt });
+  }
+  // stake: prefer the amount near "Wager"; ignore $0.00 and nav-bar amounts
   let stake = '';
-  for (const L of lines) { if (/payout/i.test(L)) continue; const sm = L.match(/\$\s?(\d+(?:\.\d{2})?)/); if (sm) { stake = sm[1]; break; } }
+  const wm = raw.match(/Wager[\s\S]{0,60}?\$\s?(\d+(?:\.\d{2})?)/i);
+  if (wm && parseFloat(wm[1]) > 0) stake = wm[1];
+  if (!stake) for (const L of lines) { if (/payout|my bets|rewards|games/i.test(L)) continue; const sm = L.match(/\$\s?(\d+(?:\.\d{2})?)/); if (sm && parseFloat(sm[1]) > 0) { stake = sm[1]; break; } }
   const idm = raw.match(/ID:?\s*(\d{8,})/i);
-  return { legs, stake, slipId: idm ? idm[1] : '' };
+  const cm = raw.match(/(\d+)\s*-?\s*Bet Parlay/i);
+  return { legs, stake, slipId: idm ? idm[1] : '', expectedLegs: cm ? parseInt(cm[1], 10) : 0 };
 }
 async function runOcr(dataUrl) {
   const status = $('#ocr-status');
@@ -466,7 +493,10 @@ async function runOcr(dataUrl) {
       $('#legs-wrap').innerHTML = '';
       parsed.legs.forEach((leg) => addLegRow(leg));
       if (parsed.slipId && !notes.value) notes.value = `Hard Rock Bet slip ${parsed.slipId}`;
-      status.textContent = `Read ${parsed.legs.length} leg${parsed.legs.length > 1 ? 's' : ''} from your screenshot — check each one below and fix anything wrong before saving.`;
+      const missing = parsed.expectedLegs && parsed.expectedLegs > parsed.legs.length ? parsed.expectedLegs - parsed.legs.length : 0;
+      status.textContent = missing
+        ? `Read ${parsed.legs.length} of ${parsed.expectedLegs} legs — ${missing} didn't read cleanly. Check each leg below, fill in any blank odds, and fix anything wrong before saving.`
+        : `Read ${parsed.legs.length} leg${parsed.legs.length > 1 ? 's' : ''} from your screenshot — check each one below and fix anything wrong before saving.`;
     } else {
       if (!notes.value) notes.value = pendingOcrText.slice(0, 400);
       status.textContent = 'Read finished, but no legs could be picked out — the raw text was added to Notes. Type the legs below; the screenshot still attaches.';

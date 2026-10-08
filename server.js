@@ -509,11 +509,11 @@ function matchGameForLeg(leg, games) {
   if (legMs !== null) {
     const legEtDate = String(leg.starts_at).slice(0, 10);
     candidates.sort((x, y) => {
-      const xSameDay = etDateStr(new Date(x.game.date)) === legEtDate ? 0 : 1;
-      const ySameDay = etDateStr(new Date(y.game.date)) === legEtDate ? 0 : 1;
+      const xSameDay = etDateStr(new Date(x.game.start)) === legEtDate ? 0 : 1;
+      const ySameDay = etDateStr(new Date(y.game.start)) === legEtDate ? 0 : 1;
       if (xSameDay !== ySameDay) return xSameDay - ySameDay;
-      const xDiff = Math.abs(new Date(x.game.date).getTime() - legMs);
-      const yDiff = Math.abs(new Date(y.game.date).getTime() - legMs);
+      const xDiff = Math.abs(new Date(x.game.start).getTime() - legMs);
+      const yDiff = Math.abs(new Date(y.game.start).getTime() - legMs);
       if (xDiff !== yDiff) return xDiff - yDiff;
       return y.score - x.score;
     });
@@ -528,7 +528,7 @@ function matchGameForLeg(leg, games) {
     const r = stateRank(x.game.state) - stateRank(y.game.state);
     if (r !== 0) return r;
     if (y.score !== x.score) return y.score - x.score;
-    return new Date(y.game.date).getTime() - new Date(x.game.date).getTime();
+    return new Date(y.game.start).getTime() - new Date(x.game.start).getTime();
   });
   return candidates[0].game;
 }
@@ -767,7 +767,7 @@ async function settleTicket(ticket) {
       if (leg.event_id && leg.starts_at) {
         const games0 = leagueGames[leg.league] || [];
         const saved = games0.find((g) => String(g.id) === String(leg.event_id));
-        if (saved && etDateStr(new Date(saved.date)) !== String(leg.starts_at).slice(0, 10)) {
+        if (saved && etDateStr(new Date(saved.start)) !== String(leg.starts_at).slice(0, 10)) {
           const right = matchGameForLeg(leg, games0);
           if (right && String(right.id) !== String(leg.event_id)) {
             await db.prepare("UPDATE legs SET status = 'pending', event_id = NULL, final_value = NULL WHERE id = ?").run(leg.id);
