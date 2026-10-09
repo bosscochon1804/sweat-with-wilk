@@ -209,44 +209,85 @@ async function toggleTicketAlerts(ticketId, turnOn) {
   await refreshAlertBadge(); render();
 }
 
+/* ===== Tickets — Hard Rock "My Bets" style ===== */
+function classifyTicket(t) {
+  if (t.status === 'lost') return 'lost';
+  if (t.status === 'won' || t.status === 'push') return 'finished';
+  const groups = groupLegsByGame(t);
+  if (groups.some((g) => g.game && g.game.state === 'in')) return 'live';
+  return 'upcoming';
+}
+function shortPick(l) {
+  let s = String(l.selection || '').replace(/\s+Moneyline$/i, '').trim();
+  if (/\b(Over|Under)\b/i.test(s)) return s;
+  const lineM = s.match(/^(.*?)\s+([+-]\d+(?:\.\d+)?)$/);
+  let team = s, line = '';
+  if (lineM) { team = lineM[1].trim(); line = ' ' + lineM[2]; }
+  const words = team.split(/\s+/).filter(Boolean);
+  let short = words.length > 1 ? words[words.length - 1] : team;
+  if (words.length > 1 && /^(golden|fighting|roaring)$/i.test(words[words.length - 2])) short = words[words.length - 2] + ' ' + short;
+  if (words.length === 1) short = team;
+  if (words.length > 1 && /^[A-Z]{2,5}$/.test(words[0])) short = words[0]; // acronym schools: UTSA, FIU, UCLA
+  if (l.market === 'Total') return s;
+  return short + line;
+}
+function marketLabel(l) {
+  if (l.market === 'Moneyline') return 'TO WIN';
+  if (l.market === 'Spread') return 'SPREAD';
+  if (l.market === 'Total') return 'TOTAL';
+  if (/\b(Over|Under)\b/i.test(l.selection || '')) return 'PLAYER PROP';
+  return String(l.market || '').toUpperCase();
+}
+function setTicketFilter(f) { state.ticketFilter = f; renderTicketsLight(); }
+function toggleTicketSelections(id) {
+  if (!state.expandedTickets) state.expandedTickets = new Set();
+  state.expandedTickets.has(id) ? state.expandedTickets.delete(id) : state.expandedTickets.add(id);
+  renderTicketsLight();
+}
+function stripHTML(g) {
+  const game = g.game;
+  if (!game) return g.gameLabel ? `<div class="small muted" style="margin-top:2px">${esc(g.gameLabel)}</div>` : '';
+  if (game.state === 'pre') {
+    return `<div class="small muted" style="margin-top:2px">${esc(g.gameLabel || '')}${game.start ? ' · ' + fmtDateTime(game.start) : ''}</div>`;
+  }
+  const detail = g.eventId ? state.detailCache.get(String(g.eventId)) : null;
+  const ticker = detail && detail.plays && detail.plays.length ? detail.plays[0].text : (game.lastPlayText || '');
+  return `<div class="hr-strip">
+    <div class="row between">
+      <span><strong>${esc(game.away.abbr)}</strong> <strong>${esc(game.away.score ?? '–')}</strong></span>
+      <span class="hr-clock">${game.state === 'in' ? '● ' : ''}${esc(game.detail || '')}</span>
+      <span><strong>${esc(game.home.score ?? '–')}</strong> <strong>${esc(game.home.abbr)}</strong></span>
+    </div>
+    ${ticker ? `<div class="hr-ticker">${esc(ticker)}</div>` : ''}
+  </div>`;
+}
 function ticketCardHTML(t) {
   const groups = groupLegsByGame(t);
   const ticketOff = state.alerts ? state.alerts.subs.some((s) => s.scope === 'ticket' && s.ticketId === t.id && !s.on) : false;
-  const head = `<div class="row between wrap">
-      <div><strong>${esc(t.title || `${t.legs.length}-leg ${t.legs[0] ? t.legs[0].league : ''} ticket`)}</strong>
-      <div class="small muted">${esc(t.sportsbook)} · Stake ${fmtMoney(t.stake)} · To win ${fmtMoney((t.potentialPayout || 0) - t.stake)} · Payout ${fmtMoney(t.potentialPayout)} ${t.boostedPayout ? '· <span style="color:var(--mint)">boosted</span>' : ''}</div>
-      <div class="small muted">${fmtDateTime(t.createdAt)}${t.source === 'morning' ? ' · Morning ticket — from today\'s Board' : ''}${t.source === 'screenshot' ? ' · From screenshot' : ''}</div></div>
-      <div class="row">${t.status === 'open' ? '<span class="pill live">Open</span>' : t.status === 'won' ? `<span class="pill won">Won · ${fmtMoney(t.payout)}</span>` : t.status === 'lost' ? '<span class="pill lost">Lost</span>' : '<span class="pill push">Push</span>'}</div>
-    </div>
-    <div class="row wrap" style="margin-top:8px">
-      <button class="btn secondary small" onclick="toggleTicketAlerts(${t.id}, ${ticketOff ? 'true' : 'false'})">🔔 Ticket alerts ${ticketOff ? 'off' : 'on'}</button>
-      <button class="btn secondary small" onclick="postToCommunity(${t.id})">Post to Community</button>
-      <button class="btn danger small" onclick="deleteTicket(${t.id}, this)">Delete</button>
-    </div>`;
-  const summary = t.legs && t.legs.length > 1 ? `<div style="border:1.5px solid var(--mint);border-radius:12px;padding:12px;margin-top:12px">
-      <div class="row between"><strong style="color:var(--mint)">🧾 THE WHOLE TICKET</strong><span class="small muted">${t.legs.length} legs</span></div>
-      ${t.legs.map((l) => `<div style="border-top:1px solid var(--line);padding:7px 0">
-        <div class="row between"><span class="sel">${esc(l.selection)}</span><span class="row" style="gap:6px"><strong style="color:var(--mint)">${fmtOdds(l.odds)}</strong>${legStatusPill(l)}</span></div>
-        <div class="small muted">${l.gameLabel ? esc(l.gameLabel) + ' · ' : ''}${esc(l.market)}${l.line ? ' · ' + esc(l.line) : ''} · ${esc(l.league)}</div>
-      </div>`).join('')}
-      <div class="small muted" style="margin-top:6px">Screenshot this block — every leg on one screen. The live sweat for each game is below.</div>
-    </div>` : '';
-  const body = groups.map((g, gi) => {
+  const expanded = state.expandedTickets ? state.expandedTickets.has(t.id) : false;
+  const isBonus = /bonus/i.test(t.notes || '');
+  const title = t.title || `${t.legs.length}-Bet Parlay`;
+  const summary = t.legs.map(shortPick).join(', ');
+  const settled = t.status === 'won' ? `<span class="pill won">Won · ${fmtMoney(t.payout)}</span>` : t.status === 'lost' ? '<span class="pill lost">Lost</span>' : t.status === 'push' ? '<span class="pill push">Push</span>' : '';
+  const body = !expanded ? '' : groups.map((g, gi) => {
     const blockId = `t${t.id}g${gi}`;
     const detail = g.eventId ? state.detailCache.get(String(g.eventId)) : null;
     const legsHtml = g.legs.map((l) => {
       const prop = state.propCache && state.propCache[t.id] ? state.propCache[t.id].find((x) => x.legId === l.id) : null;
-      return `<div class="leg"><div class="row between"><span class="sel">${esc(l.selection)}</span>${legStatusPill(l)}</div>
-        <div class="small muted">${esc(l.market)}${l.line ? ` · ${esc(l.line)}` : ''} · ${fmtOdds(l.odds)} · ${esc(l.league)}</div>
+      const dotCls = l.status === 'won' ? 'won' : l.status === 'lost' ? 'lost' : (g.game && g.game.state === 'in' && l.status === 'pending') ? 'live' : '';
+      return `<div style="margin-top:12px">
+        <div class="row between"><span class="row" style="gap:8px"><span class="legdot ${dotCls}"></span><strong>${esc(shortPick(l))}</strong></span><strong class="hr-odds">${fmtOdds(l.odds)}</strong></div>
+        <div class="small muted" style="letter-spacing:.07em;margin-top:1px">${esc(marketLabel(l))}${l.status !== 'pending' ? ' · ' + esc(l.status.toUpperCase()) : ''}</div>
+        ${l.selection !== shortPick(l) ? `<div class="small muted">${esc(l.selection)}</div>` : ''}
         ${prop ? (prop.available ? `<div class="small" style="margin-top:5px"><strong>${esc(prop.display || '')}</strong>${prop.progress !== null ? `<div class="propbar"><div style="width:${prop.progress}%"></div></div>` : ''}<span class="muted">${esc(prop.remaining || '')}</span></div>` : `<div class="small muted" style="margin-top:5px">${esc(prop.statusText || '')}</div>`) : ''}
       </div>`;
     }).join('');
-    const expanded = state.expandedBlocks.has(blockId);
-    return `<div style="border-top:1px solid var(--line);margin-top:12px;padding-top:12px">
-      ${gameHeaderHTML(g.game, g.league, g.gameLabel)}
+    const blockOpen = state.expandedBlocks.has(blockId);
+    return `<div style="border-top:1px solid var(--line);margin-top:4px">
       ${legsHtml}
-      <button class="btn secondary small" style="margin-top:8px" onclick="toggleGameBlock('${blockId}')">${expanded ? 'Hide game detail ▾' : 'Game detail — plays, stats, scoring ▸'}</button>
-      ${expanded ? `
+      ${stripHTML(g)}
+      <button class="btn secondary small" style="margin-top:8px" onclick="toggleGameBlock('${blockId}')">${blockOpen ? 'Hide game detail ▾' : 'Game detail — plays, stats, scoring ▸'}</button>
+      ${blockOpen ? `
       ${linescoreHTML(detail)}
       ${situationHTML(g.game, detail)}
       ${winProbHTML(detail && detail.winProbHome !== null && detail.winProbHome !== undefined ? { winProbHome: detail.winProbHome, home: g.game ? g.game.home : {}, away: g.game ? g.game.away : {} } : g.game)}
@@ -254,52 +295,55 @@ function ticketCardHTML(t) {
       ${detailTabsHTML(blockId, g.league, g.eventId)}` : ''}
     </div>`;
   }).join('');
-  return `<div class="card">${head}${summary}${body}${t.notes ? `<div class="small muted" style="margin-top:10px">${esc(t.notes)}</div>` : ''}${t.hasImage ? `<img class="ticket-img" src="/api/tickets/${t.id}/image" alt="Ticket screenshot">` : ''}</div>`;
+  return `<div class="card">
+    <div class="row between">
+      <span class="row" style="gap:8px"><span class="hr-badge">${t.legs.length > 1 ? 'PARLAY' : 'SINGLE'}</span><strong>${esc(title)}</strong></span>
+      <strong class="hr-combined">${fmtOdds(t.combinedOdds)}</strong>
+    </div>
+    <div class="small muted hr-summary">${esc(summary)}</div>
+    <div class="row between" style="margin-top:10px">
+      <div><div class="small muted">Wager</div>${isBonus ? `<span class="wager-pill">${fmtMoney(t.stake)} BONUS</span>` : `<strong>${fmtMoney(t.stake)}</strong>`}</div>
+      <div style="text-align:right"><div class="small muted">Payout</div><strong>${fmtMoney(t.boostedPayout || t.potentialPayout)}</strong></div>
+    </div>
+    ${settled ? `<div style="margin-top:8px">${settled}</div>` : ''}
+    <div class="row between" style="margin-top:8px">
+      <span class="small muted">${t.externalRef ? 'ID: ' + esc(t.externalRef) : esc(fmtDateTime(t.createdAt))}${t.source === 'morning' ? ' · Morning ticket' : ''}${t.source === 'screenshot' ? ' · From screenshot' : ''}</span>
+    </div>
+    <button class="hr-toggle" onclick="toggleTicketSelections(${t.id})">${expanded ? 'Hide selections ▴' : 'Show selections ▾'}</button>
+    ${body}
+    <div class="row wrap" style="margin-top:10px">
+      <button class="btn secondary small" onclick="toggleTicketAlerts(${t.id}, ${ticketOff ? 'true' : 'false'})">🔔 Ticket alerts ${ticketOff ? 'off' : 'on'}</button>
+      <button class="btn secondary small" onclick="postToCommunity(${t.id})">Post to Community</button>
+      <button class="btn danger small" onclick="deleteTicket(${t.id}, this)">Delete</button>
+    </div>
+    ${t.notes ? `<div class="small muted" style="margin-top:10px">${esc(t.notes)}</div>` : ''}${t.hasImage ? `<img class="ticket-img" src="/api/tickets/${t.id}/image" alt="Ticket screenshot">` : ''}
+  </div>`;
+}
+function filteredTickets() {
+  if (!state.expandedTickets) state.expandedTickets = new Set();
+  const f = state.ticketFilter || 'all';
+  if (f === 'all') return state.tickets;
+  return state.tickets.filter((t) => classifyTicket(t) === f);
 }
 async function renderTickets() {
-  const el = $('#view-tickets');
-  if (!state.user) { el.innerHTML = '<h2>Your Tickets</h2>' + signInPromptHTML('Sign in to add tickets and sweat them live, play by play.'); return; }
-  if (!$('#tickets-list')) el.innerHTML = `<div class="row between"><h2>Your Tickets</h2><button class="btn" onclick="openAddTicket()">+ Add Ticket</button></div><div id="tickets-list"><div class="empty">Loading…</div></div>`;
-  try {
-    await loadTickets();
-    const open = state.tickets.filter((t) => t.status === 'open');
-    const liveGames = [];
-    const seenLive = new Set();
-    for (const t of open) for (const g of groupLegsByGame(t)) {
-      if (!g.game || g.game.state !== 'in') continue;
-      const key = g.eventId ? `ev:${g.eventId}` : `${g.league}|${g.gameLabel}`;
-      if (seenLive.has(key)) continue; // same game on several tickets shows ONCE
-      seenLive.add(key);
-      liveGames.push({ t, g });
-    }
-    let html = '';
-    if (liveGames.length) {
-      html += `<h3>Live now — your games</h3>` + liveGames.map(({ g }) => `<div class="card tight">${gameHeaderHTML(g.game, g.league, g.gameLabel)}</div>`).join('');
-    }
-    html += state.tickets.length ? state.tickets.map(ticketCardHTML).join('') : '<div class="card"><div class="empty">No tickets yet.<br>Tap + Add Ticket — screenshot or type it in.</div></div>';
-    $('#tickets-list').innerHTML = html;
-    // fetch details + prop progress for open tickets
-    state.propCache = state.propCache || {};
-    for (const t of open) {
-      groupLegsByGame(t).forEach((g, gi) => { if (g.eventId && state.expandedBlocks.has(`t${t.id}g${gi}`)) ensureDetail(g.league, g.eventId); });
-      api('GET', `/api/props?ticketId=${t.id}`).then((d) => { state.propCache[t.id] = d.props || []; if (state.view === 'tickets') renderTicketsLight(); }).catch(() => {});
-    }
-  } catch (e) {
-    $('#tickets-list').innerHTML = `<div class="err">${esc(e.message)}</div>`;
-  }
+  const list = $('#ticket-list');
+  if (!state.user) { list.innerHTML = `<div class="card"><div class="empty">Sign in to use your tracker.<br><br><button class="btn" onclick="showView('account')">Go to Account</button></div></div>`; return; }
+  try { state.tickets = await api('GET', '/api/tickets'); } catch { /* keep old */ }
+  await loadPropProgress();
+  renderTicketsLight();
 }
 function renderTicketsLight() {
-  const list = $('#tickets-list');
-  if (!list) return;
-  const open = state.tickets.filter((t) => t.status === 'open');
-  let html = '';
-  const liveGames = [];
-  for (const t of open) for (const g of groupLegsByGame(t)) if (g.game && g.game.state === 'in') liveGames.push({ t, g });
-  if (liveGames.length) html += `<h3>Live now — your games</h3>` + liveGames.map(({ g }) => `<div class="card tight">${gameHeaderHTML(g.game, g.league, g.gameLabel)}</div>`).join('');
-  html += state.tickets.length ? state.tickets.map(ticketCardHTML).join('') : '<div class="card"><div class="empty">No tickets yet.</div></div>';
-  list.innerHTML = html;
-  for (const t of open) for (const g of groupLegsByGame(t)) if (g.eventId) ensureDetail(g.league, g.eventId);
+  const list = $('#ticket-list');
+  const counts = { all: state.tickets.length, upcoming: 0, live: 0, finished: 0, lost: 0 };
+  for (const t of state.tickets) counts[classifyTicket(t)]++;
+  const f = state.ticketFilter || 'all';
+  const chip = (key, label) => `<button class="fchip ${f === key ? 'on' : ''}" onclick="setTicketFilter('${key}')">${label}${key === 'live' && counts.live ? ` <span class="fchip-n">${counts.live}</span>` : ''}</button>`;
+  const chips = `<div class="row" style="gap:8px;margin-bottom:12px;flex-wrap:wrap">${chip('all', 'All')}${chip('upcoming', 'Upcoming')}${chip('live', 'Live')}${chip('finished', 'Finished')}${chip('lost', 'Lost')}</div>`;
+  const vis = filteredTickets();
+  list.innerHTML = chips + (vis.length ? vis.map(ticketCardHTML).join('') : '<div class="card"><div class="empty">No tickets in this bucket yet.</div></div>');
+  if (state.expandedTickets) for (const t of vis) if (state.expandedTickets.has(t.id)) for (const g of groupLegsByGame(t)) if (g.eventId) ensureDetail(g.league, g.eventId);
 }
+
 async function deleteTicket(id, btn) {
   if (!armButton(btn, 'Tap again to DELETE')) return;
   try {
