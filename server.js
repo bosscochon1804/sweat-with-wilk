@@ -904,7 +904,7 @@ async function alertCycle() {
         const live = liveTeamLegState(leg, game);
         state.legLive = live;
         if (prev.legLive && live && prev.legLive !== live && (live === 'winning' || live === 'losing')) {
-          await addAlert(ticket.user_id, 'leg_flip', `Leg flipped: ${leg.selection}`, `Now ${live.toUpperCase()} — ${game.away.abbr} ${game.away.score} @ ${game.home.abbr} ${game.home.score} (${game.detail})`, ticket.id, game.id, `legflip:${leg.id}:${live}:${game.away.score}-${game.home.score}`);
+          await addAlert(ticket.user_id, 'leg_flip', `Leg flipped: ${leg.selection}`, `Now ${live.toUpperCase()} — ${game.away.abbr} ${game.away.score} @ ${game.home.abbr} ${game.home.score} (${game.detail})`, ticket.id, game.id, `legflip:${leg.id}:${live}`);
         }
       } else {
         const pv = await propCurrentValue(leg, game);
@@ -915,6 +915,7 @@ async function alertCycle() {
             await addAlert(ticket.user_id, 'prop_cross', `Prop crossed: ${leg.selection}`, `${pv.prop.player} at ${pv.value} vs line ${pv.prop.line} (${pv.prop.statLabel})`, ticket.id, game.id, `propcross:${leg.id}`);
           }
           state.propCrossed = crossed;
+          state.propDead = !!prev.propDead;
           // heuristic dead: late in the final period, still short of an Over line
           if (game.state === 'in' && pv.prop.dir === 'over' && pv.value <= pv.prop.line) {
             const latePeriod = { NFL: 4, NBA: 4, WNBA: 4, NHL: 3 }[leg.league];
