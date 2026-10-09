@@ -244,7 +244,14 @@ async function renderTickets() {
     await loadTickets();
     const open = state.tickets.filter((t) => t.status === 'open');
     const liveGames = [];
-    for (const t of open) for (const g of groupLegsByGame(t)) if (g.game && g.game.state === 'in') liveGames.push({ t, g });
+    const seenLive = new Set();
+    for (const t of open) for (const g of groupLegsByGame(t)) {
+      if (!g.game || g.game.state !== 'in') continue;
+      const key = g.eventId ? `ev:${g.eventId}` : `${g.league}|${g.gameLabel}`;
+      if (seenLive.has(key)) continue; // same game on several tickets shows ONCE
+      seenLive.add(key);
+      liveGames.push({ t, g });
+    }
     let html = '';
     if (liveGames.length) {
       html += `<h3>Live now — your games</h3>` + liveGames.map(({ g }) => `<div class="card tight">${gameHeaderHTML(g.game, g.league, g.gameLabel)}</div>`).join('');
