@@ -326,14 +326,23 @@ function filteredTickets() {
   return state.tickets.filter((t) => classifyTicket(t) === f);
 }
 async function renderTickets() {
-  const list = $('#ticket-list');
-  if (!state.user) { list.innerHTML = `<div class="card"><div class="empty">Sign in to use your tracker.<br><br><button class="btn" onclick="showView('account')">Go to Account</button></div></div>`; return; }
-  try { state.tickets = await api('GET', '/api/tickets'); } catch { /* keep old */ }
-  await loadPropProgress();
-  renderTicketsLight();
+  const el = $('#view-tickets');
+  if (!state.user) { el.innerHTML = '<h2>Your Tickets</h2>' + signInPromptHTML('Sign in to add tickets and sweat them live, play by play.'); return; }
+  if (!$('#tickets-list')) el.innerHTML = `<div class="row between"><h2>Your Tickets</h2><button class="btn" onclick="openAddTicket()">+ Add Ticket</button></div><div id="tickets-list"><div class="empty">Loading…</div></div>`;
+  try {
+    await loadTickets();
+    renderTicketsLight();
+    state.propCache = state.propCache || {};
+    for (const t of state.tickets.filter((x) => x.status === 'open')) {
+      api('GET', `/api/props?ticketId=${t.id}`).then((d) => { state.propCache[t.id] = d.props || []; if (state.view === 'tickets') renderTicketsLight(); }).catch(() => {});
+    }
+  } catch (e) {
+    const l = $('#tickets-list'); if (l) l.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
 }
 function renderTicketsLight() {
-  const list = $('#ticket-list');
+  const list = $('#tickets-list');
+  if (!list) return;
   const counts = { all: state.tickets.length, upcoming: 0, live: 0, finished: 0, lost: 0 };
   for (const t of state.tickets) counts[classifyTicket(t)]++;
   const f = state.ticketFilter || 'all';
@@ -343,7 +352,6 @@ function renderTicketsLight() {
   list.innerHTML = chips + (vis.length ? vis.map(ticketCardHTML).join('') : '<div class="card"><div class="empty">No tickets in this bucket yet.</div></div>');
   if (state.expandedTickets) for (const t of vis) if (state.expandedTickets.has(t.id)) for (const g of groupLegsByGame(t)) if (g.eventId) ensureDetail(g.league, g.eventId);
 }
-
 async function deleteTicket(id, btn) {
   if (!armButton(btn, 'Tap again to DELETE')) return;
   try {
