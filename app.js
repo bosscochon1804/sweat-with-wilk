@@ -27,7 +27,7 @@ const state = {
   user: null, settings: null, tickets: [], view: 'tickets',
   scoresLeague: 'NFL', scoresCache: {}, boardDate: null,
   newsLeague: 'NFL',
-  detailCache: new Map(), blockTab: new Map(), fullPlays: new Set(),
+  detailCache: new Map(), blockTab: new Map(), fullPlays: new Set(), expandedBlocks: new Set(),
   alerts: null, communityCache: null,
 };
 
@@ -172,6 +172,7 @@ async function ensureDetail(league, eventId) {
   } catch { /* keep stale */ }
 }
 function setBlockTab(blockId, tab) { state.blockTab.set(blockId, tab); render(); }
+function toggleGameBlock(blockId) { state.expandedBlocks.has(blockId) ? state.expandedBlocks.delete(blockId) : state.expandedBlocks.add(blockId); render(); }
 function toggleFullPlays(blockId) { state.fullPlays.has(blockId) ? state.fullPlays.delete(blockId) : state.fullPlays.add(blockId); render(); }
 
 function gameAlertToggleHTML(ticketId, eventId, league) {
@@ -220,14 +221,17 @@ function ticketCardHTML(t) {
         ${prop ? (prop.available ? `<div class="small" style="margin-top:5px"><strong>${esc(prop.display || '')}</strong>${prop.progress !== null ? `<div class="propbar"><div style="width:${prop.progress}%"></div></div>` : ''}<span class="muted">${esc(prop.remaining || '')}</span></div>` : `<div class="small muted" style="margin-top:5px">${esc(prop.statusText || '')}</div>`) : ''}
       </div>`;
     }).join('');
+    const expanded = state.expandedBlocks.has(blockId);
     return `<div style="border-top:1px solid var(--line);margin-top:12px;padding-top:12px">
       ${gameHeaderHTML(g.game, g.league, g.gameLabel)}
+      ${legsHtml}
+      <button class="btn secondary small" style="margin-top:8px" onclick="toggleGameBlock('${blockId}')">${expanded ? 'Hide game detail ▾' : 'Game detail — plays, stats, scoring ▸'}</button>
+      ${expanded ? `
       ${linescoreHTML(detail)}
       ${situationHTML(g.game, detail)}
       ${winProbHTML(detail && detail.winProbHome !== null && detail.winProbHome !== undefined ? { winProbHome: detail.winProbHome, home: g.game ? g.game.home : {}, away: g.game ? g.game.away : {} } : g.game)}
       <div class="row" style="margin-top:8px">${gameAlertToggleHTML(t.id, g.eventId, g.league)}</div>
-      ${legsHtml}
-      ${detailTabsHTML(blockId, g.league, g.eventId)}
+      ${detailTabsHTML(blockId, g.league, g.eventId)}` : ''}
     </div>`;
   }).join('');
   return `<div class="card">${head}${summary}${body}${t.notes ? `<div class="small muted" style="margin-top:10px">${esc(t.notes)}</div>` : ''}${t.hasImage ? `<img class="ticket-img" src="/api/tickets/${t.id}/image" alt="Ticket screenshot">` : ''}</div>`;
@@ -250,7 +254,7 @@ async function renderTickets() {
     // fetch details + prop progress for open tickets
     state.propCache = state.propCache || {};
     for (const t of open) {
-      for (const g of groupLegsByGame(t)) if (g.eventId) ensureDetail(g.league, g.eventId);
+      groupLegsByGame(t).forEach((g, gi) => { if (g.eventId && state.expandedBlocks.has(`t${t.id}g${gi}`)) ensureDetail(g.league, g.eventId); });
       api('GET', `/api/props?ticketId=${t.id}`).then((d) => { state.propCache[t.id] = d.props || []; if (state.view === 'tickets') renderTicketsLight(); }).catch(() => {});
     }
   } catch (e) {
