@@ -7,11 +7,25 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { createClient } = require('@libsql/client');
+/* Web Push is optional at boot: if the package or the VAPID keys are missing,
+   the server still runs and the push endpoints report "not configured". */
+let webpush = null;
+try { webpush = require('web-push'); } catch { webpush = null; }
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'app.db');
 const PUSH_TOKEN = process.env.PUSH_TOKEN || '';
 const PUBLIC_DIR = path.join(__dirname, 'public');
+/* Web Push (VAPID). Keys live in env vars on the host; the public key is safe
+   to hand to browsers, the private key never leaves the server. */
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:bosscochon1804@gmail.com';
+const PUSH_ENABLED = !!(webpush && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
+if (PUSH_ENABLED) {
+  try { webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY); }
+  catch (e) { console.error('VAPID setup failed: ' + (e && e.message ? e.message : 'unknown')); }
+}
 const UPLOAD_DIR = path.join(__dirname, 'data', 'uploads');
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -178,6 +192,14 @@ CREATE TABLE IF NOT EXISTS alert_leg_states (
   user_id INTEGER NOT NULL,
   state_json TEXT NOT NULL DEFAULT '{}',
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 `;
 
@@ -865,10 +887,35 @@ async function addAlert(userId, type, title, body, ticketId, eventId, dedupeKey)
   const { prefs, quietStart, quietEnd } = await getPrefs(userId);
   if (prefs[type] === false) return;
   const held = inQuietHours({ quietStart, quietEnd }) ? 1 : 0;
+  let inserted = false;
   try {
-    await db.prepare('INSERT INTO alerts (user_id, type, title, body, ticket_id, event_id, dedupe_key, held_quietly, is_read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)')
+    const r = await db.prepare('INSERT INTO alerts (user_id, type, title, body, ticket_id, event_id, dedupe_key, held_quietly, is_read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)')
       .run(userId, type, title, body, ticketId || null, eventId || null, dedupeKey, held, nowISO());
+    inserted = !r || r.changes !== 0;
   } catch { /* duplicate dedupe_key — never fire the same event twice */ }
+  /* Lock-screen push mirrors the in-app alert, but only when the alert
+     actually landed and was not held by quiet hours. Fire-and-forget:
+     a push failure must never slow or break the alerts engine. */
+  if (inserted && !held && PUSH_ENABLED) {
+    sendPushToUser(userId, title, body).catch(() => {});
+  }
+}
+async function sendPushToUser(userId, title, body) {
+  if (!PUSH_ENABLED) return;
+  const subs = await db.prepare('SELECT * FROM push_subscriptions WHERE user_id = ?').all(userId);
+  if (!subs.length) return;
+  const payload = JSON.stringify({ title: String(title || 'Sweat With Wilk'), body: String(body || ''), url: '/' });
+  await Promise.allSettled(subs.map(async (s) => {
+    try {
+      await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, payload, { TTL: 3600 });
+    } catch (e) {
+      /* 404/410 = the browser killed this subscription; prune it. Anything
+         else is transient — keep the row and try again next alert. */
+      if (e && (e.statusCode === 404 || e.statusCode === 410)) {
+        await db.prepare('DELETE FROM push_subscriptions WHERE id = ?').run(s.id).catch(() => {});
+      }
+    }
+  }));
 }
 async function alertsEnabledFor(userId, ticketId, eventId) {
   const rows = await db.prepare('SELECT * FROM alert_subs WHERE user_id = ?').all(userId);
@@ -1473,6 +1520,31 @@ const server = http.createServer(async (req, res) => {
       const on = b.on === false ? 0 : 1;
       await db.prepare('INSERT INTO alert_subs (user_id, scope, ticket_id, event_id, on_flag) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, scope, ticket_id, event_id) DO UPDATE SET on_flag = excluded.on_flag')
         .run(u.id, scope, scope === 'ticket' ? Number(b.ticketId) || null : null, scope === 'game' ? String(b.eventId || '') : null, on);
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    /* ---- Web Push subscriptions ---- */
+    if (p === '/api/push/key' && req.method === 'GET') {
+      return sendJSON(res, 200, { enabled: PUSH_ENABLED, publicKey: PUSH_ENABLED ? VAPID_PUBLIC_KEY : '' });
+    }
+    if (p === '/api/push/subscribe' && req.method === 'POST') {
+      const u = await currentUser(req);
+      if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
+      if (!PUSH_ENABLED) return sendJSON(res, 503, { error: 'Push is not configured on the server yet.' });
+      const b = await readBody(req);
+      const endpoint = String(b.endpoint || '');
+      const p256dh = String((b.keys && b.keys.p256dh) || '');
+      const auth = String((b.keys && b.keys.auth) || '');
+      if (!endpoint.startsWith('https://') || !p256dh || !auth) return sendJSON(res, 400, { error: 'Bad subscription.' });
+      await db.prepare('INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth')
+        .run(u.id, endpoint, p256dh, auth, nowISO());
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (p === '/api/push/unsubscribe' && req.method === 'POST') {
+      const u = await currentUser(req);
+      if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
+      const b = await readBody(req);
+      await db.prepare('DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?').run(u.id, String(b.endpoint || ''));
       return sendJSON(res, 200, { ok: true });
     }
 

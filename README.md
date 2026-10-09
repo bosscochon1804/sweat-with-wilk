@@ -28,8 +28,10 @@ What it does:
   results. It starts empty — no fake members, ever.
 - **Alerts** — an in-app inbox with a badge: game starts, leg flips, props
   crossing, leg finals, and ticket settlements, with per-type preferences and
-  quiet hours. **Push notifications are NOT included** — alerts live in the app
-  only; nothing reaches your phone's lock screen.
+  quiet hours. **Lock-screen push notifications included** — when a user turns
+  push on (Account → Alerts), the same alerts also go to their phone's lock
+  screen via Web Push. Requires VAPID keys in the host env (see .env.example);
+  on iPhone the app must be added to the home screen first.
 
 ## Run it locally
 

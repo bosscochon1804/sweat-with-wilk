@@ -209,6 +209,55 @@ async function toggleTicketAlerts(ticketId, turnOn) {
   await refreshAlertBadge(); render();
 }
 
+/* ===== Web Push (lock-screen alerts) ===== */
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+async function fillPushRow() {
+  const row = document.getElementById('push-row');
+  if (!row) return;
+  const supported = ('serviceWorker' in navigator) && ('PushManager' in window) && ('Notification' in window);
+  if (!supported) {
+    const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    const standalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
+    row.innerHTML = (ios && !standalone)
+      ? '<div class="small muted">📲 On iPhone, lock-screen alerts need the app on your home screen first: tap <strong>Share → Add to Home Screen</strong>, open Sweat With Wilk from there, then come back to this page to turn push on.</div>'
+      : '<div class="small muted">This browser does not support push notifications.</div>';
+    return;
+  }
+  let keyInfo = null;
+  try { keyInfo = await api('GET', '/api/push/key'); } catch { keyInfo = null; }
+  if (!keyInfo || !keyInfo.enabled) { row.innerHTML = '<div class="small muted">Push is being set up on the server — check back shortly.</div>'; return; }
+  let sub = null;
+  try { const reg = await navigator.serviceWorker.ready; sub = await reg.pushManager.getSubscription(); } catch { sub = null; }
+  if (Notification.permission === 'denied') { row.innerHTML = '<div class="small muted">Push is blocked in this browser\'s site settings. Allow notifications there, then come back here.</div>'; return; }
+  row.innerHTML = `<div class="switch-row"><span>📲 Lock-screen push alerts</span><input type="checkbox" style="width:auto" ${sub ? 'checked' : ''} onchange="togglePush(this.checked)"></div>
+    <div class="small muted">${sub ? 'On for this device. The alert types you have on below will also pop on your lock screen — quiet hours still hold them back.' : 'Off. Turn it on and allow notifications so game starts, leg flips, and settlements reach your lock screen.'}</div><div id="push-msg"></div>`;
+}
+async function togglePush(on) {
+  const msg = document.getElementById('push-msg');
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    if (on) {
+      const keyInfo = await api('GET', '/api/push/key');
+      if (!keyInfo || !keyInfo.enabled) throw new Error('Push is not configured on the server yet.');
+      const perm = await Notification.requestPermission();
+      if (perm !== 'granted') throw new Error('Notifications were not allowed.');
+      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(keyInfo.publicKey) });
+      await api('POST', '/api/push/subscribe', sub.toJSON());
+    } else {
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) { await api('POST', '/api/push/unsubscribe', { endpoint: sub.endpoint }); await sub.unsubscribe(); }
+    }
+  } catch (e) { if (msg) msg.innerHTML = `<div class="err" style="margin-top:8px">${esc(e.message || 'Push toggle failed.')}</div>`; }
+  fillPushRow();
+}
+
 /* ===== Tickets — Hard Rock "My Bets" style ===== */
 function classifyTicket(t) {
   if (t.status === 'lost') return 'lost';
@@ -918,7 +967,8 @@ async function renderAccount() {
       <button class="btn" style="margin-top:12px" onclick="saveSettings()">Save settings</button>
     </div>
     <div class="card" id="alerts-center"><h3 style="margin-top:0;color:var(--text);text-transform:none;letter-spacing:0">Alerts</h3>
-      <div class="small muted" style="margin-bottom:8px">Alerts live here in the app, with a badge on the bell. <strong>Push notifications are not included</strong> — nothing is sent to your phone's lock screen.</div>
+      <div class="small muted" style="margin-bottom:8px">Alerts live here in the app, with a badge on the bell — and with push on, they hit your phone's lock screen too.</div>
+      <div id="push-row" style="margin:10px 0"></div>
       ${a ? `<div class="row between"><span class="small muted">${a.unread} unread</span><button class="btn secondary small" onclick="markAllRead()">Mark all read</button></div>
       <div style="margin-top:10px">${a.alerts.length ? a.alerts.map((al) => `<div class="alert-item ${al.read ? 'read' : ''}" onclick="markRead(${al.id})"><div><strong>${esc(al.title)}</strong> ${al.heldQuietly ? '<span class="pill">held quietly</span>' : ''}</div><div class="small muted">${esc(al.body)}</div><div class="tiny muted">${fmtDateTime(al.createdAt)}</div></div>`).join('') : '<div class="empty">No alerts yet. They fire for your open tickets: game starts, leg flips, props crossing, finals, and settlements.</div>'}</div>
       <h3 style="margin-top:16px">Alert preferences</h3>
@@ -931,6 +981,7 @@ async function renderAccount() {
       <div class="small muted" style="margin-top:6px">Alerts during quiet hours still land here, flagged "held quietly" — they just don't raise the badge.</div>`
       : '<div class="empty">Loading alerts…</div>'}
     </div>`;
+  fillPushRow();
   if (!a) refreshAlertBadge().then(() => { if (state.view === 'account') renderAccount(); });
 }
 async function doSignUp() {

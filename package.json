@@ -1,1 +1,1 @@
-{"dependencies":{"@libsql/client":"0.18.0"},"description":"Sweat With Wilk — standalone live bet tracker.","engines":{"node":">=22"},"license":"UNLICENSED","main":"server.js","name":"sweat-with-wilk","private":true,"scripts":{"start":"node server.js"},"version":"1.0.0"}
+{"dependencies":{"@libsql/client":"0.18.0","web-push":"^3.6.7"},"description":"Sweat With Wilk — standalone live bet tracker.","engines":{"node":">=22"},"license":"UNLICENSED","main":"server.js","name":"sweat-with-wilk","private":true,"scripts":{"start":"node server.js"},"version":"1.0.0"}
