@@ -3,6 +3,26 @@
 const $ = (s, el) => (el || document).querySelector(s);
 const $$ = (s, el) => [...(el || document).querySelectorAll(s)];
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function showToast(msg) {
+  const root = document.getElementById('toast-root');
+  if (!root) return;
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  root.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 320); }, 3400);
+}
+// Two-tap confirm that works in every webview (native confirm() is silently swallowed in some).
+function armButton(btn, armedLabel) {
+  if (!btn) return true;
+  if (btn.dataset.armed === '1') return true;
+  btn.dataset.armed = '1';
+  btn.dataset.orig = btn.textContent;
+  btn.textContent = armedLabel;
+  btn.classList.add('armed');
+  setTimeout(() => { if (btn.isConnected && btn.dataset.armed === '1') { btn.dataset.armed = ''; btn.textContent = btn.dataset.orig || btn.textContent; btn.classList.remove('armed'); } }, 4000);
+  return false;
+}
 async function api(method, path, body) {
   const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   const data = await r.json().catch(() => ({}));
@@ -201,7 +221,7 @@ function ticketCardHTML(t) {
     <div class="row wrap" style="margin-top:8px">
       <button class="btn secondary small" onclick="toggleTicketAlerts(${t.id}, ${ticketOff ? 'true' : 'false'})">🔔 Ticket alerts ${ticketOff ? 'off' : 'on'}</button>
       <button class="btn secondary small" onclick="postToCommunity(${t.id})">Post to Community</button>
-      <button class="btn danger small" onclick="deleteTicket(${t.id})">Delete</button>
+      <button class="btn danger small" onclick="deleteTicket(${t.id}, this)">Delete</button>
     </div>`;
   const summary = t.legs && t.legs.length > 1 ? `<div style="border:1.5px solid var(--mint);border-radius:12px;padding:12px;margin-top:12px">
       <div class="row between"><strong style="color:var(--mint)">🧾 THE WHOLE TICKET</strong><span class="small muted">${t.legs.length} legs</span></div>
@@ -280,15 +300,18 @@ function renderTicketsLight() {
   list.innerHTML = html;
   for (const t of open) for (const g of groupLegsByGame(t)) if (g.eventId) ensureDetail(g.league, g.eventId);
 }
-async function deleteTicket(id) {
-  if (!confirm('Delete this ticket? This cannot be undone.')) return;
-  await api('DELETE', `/api/tickets/${id}`);
-  state.tickets = state.tickets.filter((t) => t.id !== id);
-  render();
+async function deleteTicket(id, btn) {
+  if (!armButton(btn, 'Tap again to DELETE')) return;
+  try {
+    await api('DELETE', `/api/tickets/${id}`);
+    state.tickets = state.tickets.filter((t) => t.id !== id);
+    render();
+    showToast('Ticket deleted.');
+  } catch (e) { showToast('Delete failed: ' + e.message); }
 }
 async function postToCommunity(id) {
-  try { await api('POST', '/api/community/ticket', { ticketId: id }); alert('Posted to Community.'); showView('community'); }
-  catch (e) { alert(e.message); }
+  try { await api('POST', '/api/community/ticket', { ticketId: id }); showToast('Posted to Community.'); showView('community'); }
+  catch (e) { showToast(e.message); }
 }
 
 /* ================= ADD TICKET ================= */
@@ -563,7 +586,7 @@ async function saveTicket() {
     closeSheet();
     await loadTickets();
     showView('tickets');
-    if (imageFailed) alert('Ticket saved — but the screenshot could not be attached. The ticket itself is in your list.');
+    if (imageFailed) showToast('Ticket saved — but the screenshot could not be attached. The ticket itself is in your list.');
   } catch (e) { err.innerHTML = `<div class="err" style="margin-top:10px">${esc(e.message)}</div>`; }
 }
 
@@ -761,7 +784,7 @@ async function renderCommunity() {
       ${post.body ? `<div style="margin-top:8px">${esc(post.body)}</div>` : ''}
       <div class="row wrap" style="margin-top:10px">
         ${post.reactions.map((r) => `<button class="reaction-btn ${r.mine ? 'on' : ''}" onclick="toggleReaction(${post.id},'${r.reaction}')">${reactionLabel[r.reaction]} · ${r.count}</button>`).join('')}
-        ${post.mine && state.user ? `<button class="reaction-btn" onclick="deletePost(${post.id})">Delete</button>` : ''}
+        ${post.mine && state.user ? `<button class="reaction-btn" onclick="deletePost(${post.id}, this)">Delete</button>` : ''}
       </div>
       <div style="margin-top:6px">${post.comments.map((c) => `<div class="comment"><strong>${esc(c.authorName)}</strong> <span class="muted small">${fmtDateTime(c.createdAt)}</span><br>${esc(c.body)}</div>`).join('')}</div>
       ${state.user ? `<div class="row" style="margin-top:8px"><input id="comment-${post.id}" placeholder="Add a comment…"><button class="btn secondary small" onclick="addComment(${post.id})">Send</button></div>` : ''}
@@ -780,21 +803,21 @@ async function renderCommunity() {
 async function createPost() {
   const body = $('#comm-new').value.trim();
   if (!body) return;
-  try { await api('POST', '/api/community/posts', { body }); renderCommunity(); } catch (e) { alert(e.message); }
+  try { await api('POST', '/api/community/posts', { body }); renderCommunity(); } catch (e) { showToast(e.message); }
 }
 async function addComment(postId) {
   const input = $(`#comment-${postId}`);
   const body = input.value.trim();
   if (!body) return;
-  try { await api('POST', `/api/community/posts/${postId}/comments`, { body }); renderCommunity(); } catch (e) { alert(e.message); }
+  try { await api('POST', `/api/community/posts/${postId}/comments`, { body }); renderCommunity(); } catch (e) { showToast(e.message); }
 }
 async function toggleReaction(postId, reaction) {
-  if (!state.user) { alert('Sign in to react.'); showView('account'); return; }
-  try { await api('POST', `/api/community/posts/${postId}/reactions`, { reaction }); renderCommunity(); } catch (e) { alert(e.message); }
+  if (!state.user) { showToast('Sign in to react.'); showView('account'); return; }
+  try { await api('POST', `/api/community/posts/${postId}/reactions`, { reaction }); renderCommunity(); } catch (e) { showToast(e.message); }
 }
-async function deletePost(postId) {
-  if (!confirm('Delete this post?')) return;
-  try { await api('DELETE', `/api/community/posts/${postId}`); renderCommunity(); } catch (e) { alert(e.message); }
+async function deletePost(postId, btn) {
+  if (!armButton(btn, 'Tap again to DELETE')) return;
+  try { await api('DELETE', `/api/community/posts/${postId}`); renderCommunity(); showToast('Post deleted.'); } catch (e) { showToast(e.message); }
 }
 
 /* ================= ACCOUNT ================= */
