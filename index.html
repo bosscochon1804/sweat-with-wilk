@@ -30,6 +30,13 @@
   <section id="view-board" class="view" hidden></section>
   <section id="view-bankroll" class="view" hidden></section>
   <section id="view-account" class="view" hidden></section>
+  <section id="view-more" class="view" hidden>
+    <h2>More</h2>
+    <button class="more-row" onclick="showView('props')"><span class="more-ico">🎯</span><span class="more-txt"><span class="more-t">Props</span><span class="more-s">Your prop legs, live + today's prop plays</span></span><span class="more-arrow">›</span></button>
+    <button class="more-row" onclick="showView('news')"><span class="more-ico">📰</span><span class="more-txt"><span class="more-t">News</span><span class="more-s">Headlines by league</span></span><span class="more-arrow">›</span></button>
+    <button class="more-row" onclick="showView('bankroll')"><span class="more-ico">💰</span><span class="more-txt"><span class="more-t">Bankroll</span><span class="more-s">Your money tracker</span></span><span class="more-arrow">›</span></button>
+    <button class="more-row" onclick="showView('account')"><span class="more-ico">👤</span><span class="more-txt"><span class="more-t">Account</span><span class="more-s">Profile, alerts + push settings</span></span><span class="more-arrow">›</span></button>
+  </section>
 </main>
 
 <div id="sheet-root"></div>
@@ -38,12 +45,9 @@
 <nav class="bottom-nav">
   <button data-nav="tickets" class="nav-btn active"><span class="nav-ico">🎟️</span><span>Tickets</span></button>
   <button data-nav="scores" class="nav-btn"><span class="nav-ico">📊</span><span>Scores</span></button>
-  <button data-nav="props" class="nav-btn"><span class="nav-ico">🎯</span><span>Props</span></button>
-  <button data-nav="news" class="nav-btn"><span class="nav-ico">📰</span><span>News</span></button>
-  <button data-nav="community" class="nav-btn"><span class="nav-ico">💬</span><span>Community</span></button>
   <button data-nav="board" class="nav-btn"><span class="nav-ico">📋</span><span>Board</span></button>
-  <button data-nav="bankroll" class="nav-btn"><span class="nav-ico">💰</span><span>Bankroll</span></button>
-  <button data-nav="account" class="nav-btn"><span class="nav-ico">👤</span><span>Account</span></button>
+  <button data-nav="community" class="nav-btn"><span class="nav-ico">💬</span><span>Community</span></button>
+  <button data-nav="more" class="nav-btn"><span class="nav-ico">☰</span><span>More</span></button>
 </nav>
 
 <script src="/app.js"></script>

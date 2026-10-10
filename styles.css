@@ -41,9 +41,15 @@ label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
 .status-won{color:var(--mint);font-weight:800}.status-lost{color:var(--red);font-weight:800}
 .status-live{color:var(--red);font-weight:700}.status-push{color:var(--amber);font-weight:800}
 .bottom-nav{position:fixed;left:0;right:0;bottom:0;z-index:40;display:flex;background:#0a100d;border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
-.nav-btn{flex:1;background:none;border:none;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:2px;padding:9px 0 7px;font-size:11px;min-width:0}
-.nav-btn .nav-ico{font-size:19px;line-height:1}
+.nav-btn{flex:1;background:none;border:none;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:2px;padding:9px 0 7px;font-size:12px;min-width:0}
+.nav-btn .nav-ico{font-size:21px;line-height:1}
 .nav-btn.active{color:var(--mint)}
+.more-row{display:flex;align-items:center;gap:12px;width:100%;background:#0e1512;border:1px solid var(--line);border-radius:12px;padding:16px 14px;margin:0 0 10px;color:#fff;text-align:left;cursor:pointer}
+.more-ico{font-size:26px;line-height:1}
+.more-txt{display:flex;flex-direction:column;gap:2px;flex:1;min-width:0}
+.more-t{font-size:17px;font-weight:700}
+.more-s{font-size:13px;color:var(--muted)}
+.more-arrow{font-size:24px;color:var(--muted)}
 .game-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
 .team-line{display:flex;justify-content:space-between;padding:5px 0;font-size:16px}
 .team-line .score{font-weight:800;font-size:18px}

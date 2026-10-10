@@ -51,10 +51,12 @@ const state = {
   alerts: null, communityCache: null,
 };
 
+const MORE_VIEWS = ['props', 'news', 'bankroll', 'account'];
+function renderMore() { /* static menu lives in index.html (#view-more) */ }
 function showView(name) {
   state.view = name;
   $$('.view').forEach((v) => { v.hidden = v.id !== `view-${name}`; });
-  $$('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.nav === name));
+  $$('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.nav === (MORE_VIEWS.includes(name) ? 'more' : name)));
   window.scrollTo(0, 0);
   render();
 }
@@ -80,7 +82,7 @@ async function refreshAlertBadge() {
 }
 function render() {
   refreshAlertBadge();
-  ({ tickets: renderTickets, scores: renderScores, props: renderProps, news: renderNews, community: renderCommunity, board: renderBoard, bankroll: renderBankroll, account: renderAccount })[state.view]();
+  ({ tickets: renderTickets, scores: renderScores, props: renderProps, news: renderNews, community: renderCommunity, board: renderBoard, bankroll: renderBankroll, account: renderAccount, more: renderMore })[state.view]();
 }
 
 /* ================= TICKETS ================= */
