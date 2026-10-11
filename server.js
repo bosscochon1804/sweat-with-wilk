@@ -965,11 +965,24 @@ async function getProjections(userId) {
 /* ---------------- The Odds API adapter (optional) ----------------
    Activates only when ODDS_API_KEY is set in the environment. Supplies real
    book prop lines (Hard Rock / FanDuel / DraftKings where offered) for the
-   leagues ESPN says have games today. Spend is bounded: normalized lines are
-   cached 30 minutes, fetches are lazy (only when projections are requested),
-   and a failure backs off for 10 minutes instead of retrying. Every failure
-   degrades silently to the Board-only behavior. ODDS_API_BASE exists so the
-   adapter can be tested against a local mock; production uses the default. */
+   leagues ESPN says have games today. Player props live on the per-event
+   endpoint: GET /v4/sports/{sport}/events (a free call) picks the next 3
+   unstarted events per league, then ONE /events/{id}/odds call per event
+   carries that league's full mapped market list. (The featured /odds
+   endpoint rejects prop markets with a 422 — that was the v21 bug: the
+   adapter degraded silently and book props were always empty.)
+   Spend discipline (free plan = 500 credits/month; one event-odds call
+   costs markets × regions credits — NFL 11, basketball 6, MLB 7, NHL 5):
+   normalized lines are cached 6 HOURS per league, fetches are lazy (only
+   when projections are requested), and a failed league backs off for 10
+   minutes instead of retrying. The adapter tracks the
+   x-requests-remaining header from every response and halts all paid
+   fetches when fewer than 100 credits remain; the free events call
+   doubles as the re-probe, so a monthly quota reset lifts the halt
+   automatically (a server restart re-probes too, since the tracked value
+   starts unknown). Every failure degrades silently to the Board-only
+   behavior. ODDS_API_BASE exists so the adapter can be tested against a
+   local mock; production uses the default. */
 const ODDS_API_BASE = process.env.ODDS_API_BASE || 'https://api.the-odds-api.com';
 const FOOTBALL_PROP_MARKETS = ['player_pass_yds', 'player_pass_tds', 'player_pass_interceptions', 'player_pass_completions', 'player_rush_yds', 'player_rush_attempts', 'player_rush_tds', 'player_reception_yds', 'player_receptions', 'player_reception_tds', 'player_anytime_td'];
 const BASKETBALL_PROP_MARKETS = ['player_points', 'player_rebounds', 'player_assists', 'player_threes', 'player_blocks', 'player_steals'];
@@ -997,14 +1010,24 @@ const ODDS_MARKET_STAT = {
 };
 const ODDS_BOOK_PRIORITY = ['hardrock', 'fanduel', 'draftkings']; // Hard Rock is the book of record
 function oddsApiEnabled() { return !!(process.env.ODDS_API_KEY || ''); }
-let oddsCache = { at: 0, lines: [] };
-let oddsFailAt = 0;
+const ODDS_CACHE_MS = 6 * 60 * 60 * 1000;    // book lines refresh at most every 6h per league
+const ODDS_FAIL_BACKOFF_MS = 10 * 60 * 1000; // a failed league backs off 10 min before retrying
+const ODDS_QUOTA_FLOOR = 100;                // halt paid fetches when the key is nearly dry
+const ODDS_EVENTS_PER_LEAGUE = 3;            // cap event-odds calls per league per refresh
+let oddsLeagueCache = {};                    // league -> { at, lines, failAt }
+let oddsQuotaRemaining = null;               // last x-requests-remaining seen (null = unknown)
+/* Every Odds API response carries quota headers — remember the newest one. */
+function noteOddsQuota(headers) {
+  try {
+    const v = Number(headers && headers.get && headers.get('x-requests-remaining'));
+    if (Number.isFinite(v)) oddsQuotaRemaining = v;
+  } catch { /* quota headers are best-effort */ }
+}
+function oddsQuotaHalted() { return oddsQuotaRemaining !== null && oddsQuotaRemaining < ODDS_QUOTA_FLOOR; }
 async function oddsBookTargets() {
   const key = process.env.ODDS_API_KEY || '';
   if (!key) return [];
   const now = Date.now();
-  if (oddsCache.at && now - oddsCache.at < 30 * 60 * 1000) return oddsCache.lines;
-  if (oddsFailAt && now - oddsFailAt < 10 * 60 * 1000) return oddsCache.lines;
   const today = etDateStr();
   const active = [];
   for (const league of Object.keys(ODDS_LEAGUES)) {
@@ -1012,9 +1035,30 @@ async function oddsBookTargets() {
     if (games.some((g) => g.state === 'in' || String(g.start).slice(0, 10) === today)) active.push(league);
   }
   const raw = [];
-  let anyOk = false;
+  let probed = false; // while quota-halted, one stale league per pass still makes its free events call
   for (const league of active) {
-    try { raw.push(...await fetchOddsLeague(league, key)); anyOk = true; } catch { /* silent */ }
+    const c = oddsLeagueCache[league];
+    if (c && now - c.at < ODDS_CACHE_MS) { raw.push(...c.lines); continue; }
+    if (c && c.failAt && now - c.failAt < ODDS_FAIL_BACKOFF_MS) { raw.push(...c.lines); continue; }
+    if (oddsQuotaHalted()) {
+      /* Paid fetches are halted (free-plan survival). fetchOddsLeague's
+         events call is free and its headers report the live quota, so one
+         stale league per pass still runs it: that is how a monthly reset
+         (remaining back over the floor) lifts the halt on its own. Later
+         leagues in the same pass just serve whatever cache they hold. */
+      if (probed) { if (c) raw.push(...c.lines); continue; }
+      probed = true;
+    }
+    try {
+      const lines = await fetchOddsLeague(league, key);
+      if (lines === null) { if (c) raw.push(...c.lines); continue; } // halted before any paid call: keep old lines, stay stale so the next pass re-probes
+      oddsLeagueCache[league] = { at: Date.now(), lines, failAt: 0 };
+      raw.push(...lines);
+    } catch { /* silent: keep the league's previous lines and back it off */
+      const prev = oddsLeagueCache[league] || { at: 0, lines: [] };
+      oddsLeagueCache[league] = { at: prev.at, lines: prev.lines, failAt: Date.now() };
+      raw.push(...prev.lines);
+    }
   }
   const rank = (b) => { const i = ODDS_BOOK_PRIORITY.indexOf(b); return i < 0 ? 99 : i; };
   const best = new Map();
@@ -1023,53 +1067,86 @@ async function oddsBookTargets() {
     const cur = best.get(k);
     if (!cur || rank(ln.bookKey) < rank(cur.bookKey)) best.set(k, ln);
   }
-  const out = [...best.values()];
-  if (anyOk) { oddsCache = { at: now, lines: out }; oddsFailAt = 0; }
-  else oddsFailAt = now;
-  return out;
+  return [...best.values()];
 }
 async function fetchOddsLeague(league, key) {
   const cfg = ODDS_LEAGUES[league];
+  const ua = { headers: { 'User-Agent': 'SweatWithWilk/1.0' } };
+  /* Step 1: the sport's events list. A free call — but its response still
+     carries the quota headers noteOddsQuota tracks. */
+  const evRes = await fetch(`${ODDS_API_BASE}/v4/sports/${cfg.sport}/events?apiKey=${encodeURIComponent(key)}`, ua);
+  noteOddsQuota(evRes.headers);
+  if (!evRes.ok) throw new Error('odds events ' + evRes.status);
+  const events = await evRes.json();
+  const nowMs = Date.now();
+  const upcoming = (Array.isArray(events) ? events : [])
+    .filter((ev) => ev && ev.id && Date.parse(ev.commence_time || '') > nowMs)
+    .sort((a, b) => Date.parse(a.commence_time) - Date.parse(b.commence_time))
+    .slice(0, ODDS_EVENTS_PER_LEAGUE);
+  if (!upcoming.length) return [];
+  /* Halt check AFTER the events call: its headers may have just lifted the
+     halt (monthly reset). Returning null tells the caller "no paid data —
+     keep your cached lines and stay stale", distinct from a real empty
+     result (no upcoming events). */
+  if (oddsQuotaHalted()) return null;
+  /* Step 2: one event-odds call per event, the league's full mapped market
+     list in the query (cost = markets x regions credits per call). */
   const markets = cfg.markets.join(',');
-  const base = `${ODDS_API_BASE}/v4/sports/${cfg.sport}/odds/?apiKey=${encodeURIComponent(key)}&markets=${markets}&oddsFormat=american`;
-  let r = await fetch(`${base}&regions=us&bookmakers=fanduel,draftkings,hardrock`, { headers: { 'User-Agent': 'SweatWithWilk/1.0' } });
-  if (!r.ok) {
-    /* one retry without the bookmaker filter (in case a book key is not
-       offered); lines are still matched to our books by key below. */
-    r = await fetch(`${base}&regions=us`, { headers: { 'User-Agent': 'SweatWithWilk/1.0' } });
-    if (!r.ok) throw new Error('odds ' + r.status);
-  }
-  const events = await r.json();
   const out = [];
-  for (const ev of Array.isArray(events) ? events : []) {
-    const matchup = `${ev.away_team || ''} at ${ev.home_team || ''}`;
-    for (const bk of ev.bookmakers || []) {
-      if (!ODDS_BOOK_PRIORITY.includes(bk.key)) continue;
-      for (const mk of bk.markets || []) {
-        const stat = ODDS_MARKET_STAT[mk.key];
-        if (!stat) continue;
-        const def = PROP_STATS.find((x) => x.stat === stat);
-        if (!def) continue;
-        const byPlayer = new Map();
-        for (const oc of mk.outcomes || []) {
-          const player = String(oc.description || '').trim();
-          if (!player) continue;
-          if (!byPlayer.has(player)) byPlayer.set(player, {});
-          const sides = byPlayer.get(player);
-          const side = String(oc.name || '').toLowerCase();
-          if (side === 'over' || side === 'under') sides[side] = oc;
-          else if (stat === 'anytime_td' && side === 'yes') sides.yes = oc;
+  let attempted = 0;
+  let succeeded = 0;
+  for (const ev of upcoming) {
+    if (oddsQuotaHalted()) break; // an earlier response in this loop reported the well dry
+    const base = `${ODDS_API_BASE}/v4/sports/${cfg.sport}/events/${encodeURIComponent(ev.id)}/odds?apiKey=${encodeURIComponent(key)}&regions=us&markets=${markets}&oddsFormat=american`;
+    let r = await fetch(`${base}&bookmakers=fanduel,draftkings,hardrock`, ua);
+    noteOddsQuota(r.headers);
+    if (!r.ok) {
+      /* one retry without the bookmaker filter (in case a book key is not
+         offered); lines are still matched to our books by key below. */
+      r = await fetch(base, ua);
+      noteOddsQuota(r.headers);
+    }
+    attempted++;
+    if (!r.ok) continue;
+    succeeded++;
+    const data = await r.json();
+    out.push(...oddsLinesFromEvent(data && typeof data === 'object' ? data : ev, league));
+  }
+  if (attempted && !succeeded) throw new Error('odds event odds failed');
+  return out;
+}
+/* Normalize one event-odds response (bookmakers -> markets -> outcomes,
+   outcome.description = player, name = Over/Under/Yes, point = line,
+   price = american odds) into projection targets for that event. */
+function oddsLinesFromEvent(ev, league) {
+  const out = [];
+  const matchup = `${ev.away_team || ''} at ${ev.home_team || ''}`;
+  for (const bk of ev.bookmakers || []) {
+    if (!ODDS_BOOK_PRIORITY.includes(bk.key)) continue;
+    for (const mk of bk.markets || []) {
+      const stat = ODDS_MARKET_STAT[mk.key];
+      if (!stat) continue;
+      const def = PROP_STATS.find((x) => x.stat === stat);
+      if (!def) continue;
+      const byPlayer = new Map();
+      for (const oc of mk.outcomes || []) {
+        const player = String(oc.description || '').trim();
+        if (!player) continue;
+        if (!byPlayer.has(player)) byPlayer.set(player, {});
+        const sides = byPlayer.get(player);
+        const side = String(oc.name || '').toLowerCase();
+        if (side === 'over' || side === 'under') sides[side] = oc;
+        else if (stat === 'anytime_td' && side === 'yes') sides.yes = oc;
+      }
+      for (const [player, sides] of byPlayer) {
+        if (stat === 'anytime_td') {
+          if (sides.yes) out.push({ kind: 'book', refId: `odds-${league}-${bk.key}-${player}-${stat}`, league, prop: { player, stat, statLabel: def.label, dir: 'over', line: 0.5 }, book: bk.title || bk.key, bookKey: bk.key, odds: sides.yes.price ?? null, matchup, commenceTime: ev.commence_time || '' });
+          continue;
         }
-        for (const [player, sides] of byPlayer) {
-          if (stat === 'anytime_td') {
-            if (sides.yes) out.push({ kind: 'book', refId: `odds-${league}-${bk.key}-${player}-${stat}`, league, prop: { player, stat, statLabel: def.label, dir: 'over', line: 0.5 }, book: bk.title || bk.key, bookKey: bk.key, odds: sides.yes.price ?? null, matchup, commenceTime: ev.commence_time || '' });
-            continue;
-          }
-          for (const dir of ['over', 'under']) {
-            const oc = sides[dir];
-            if (!oc || oc.point === undefined || oc.point === null) continue;
-            out.push({ kind: 'book', refId: `odds-${league}-${bk.key}-${player}-${stat}-${dir}`, league, prop: { player, stat, statLabel: def.label, dir, line: Number(oc.point) }, book: bk.title || bk.key, bookKey: bk.key, odds: oc.price ?? null, matchup, commenceTime: ev.commence_time || '' });
-          }
+        for (const dir of ['over', 'under']) {
+          const oc = sides[dir];
+          if (!oc || oc.point === undefined || oc.point === null) continue;
+          out.push({ kind: 'book', refId: `odds-${league}-${bk.key}-${player}-${stat}-${dir}`, league, prop: { player, stat, statLabel: def.label, dir, line: Number(oc.point) }, book: bk.title || bk.key, bookKey: bk.key, odds: oc.price ?? null, matchup, commenceTime: ev.commence_time || '' });
         }
       }
     }
