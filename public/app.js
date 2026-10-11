@@ -43,10 +43,15 @@ function fmtDay(dateStr) {
   return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
 }
 const LEAGUES = ['NFL', 'NBA', 'MLB', 'NHL', 'NCAAF', 'WNBA', 'NCAAB', 'NCAAW', 'UFC'];
+const SCORE_PILLS = ['NFL', 'NHL', 'MLB', 'SOCCER', 'NBA', 'NCAAF', 'WNBA', 'NCAAB', 'NCAAW', 'UFC', 'ALL'];
+const SCORE_FETCH = { SOCCER: ['MLS', 'EPL'], ALL: ['NFL', 'NCAAF', 'NBA', 'NCAAB', 'NCAAW', 'WNBA', 'MLB', 'NHL', 'MLS', 'EPL', 'UFC'] };
+const NEWS_LEAGUES = ['ALL', 'NFL', 'NHL', 'MLB', 'NBA', 'SOCCER', 'NCAAF', 'UFC', 'WNBA', 'NCAAB', 'NCAAW'];
+const NEWS_FETCH = { ALL: ['NFL', 'NHL', 'MLB', 'NBA', 'NCAAF', 'UFC', 'WNBA', 'NCAAB', 'NCAAW', 'MLS'], SOCCER: ['MLS'] };
 const state = {
-  user: null, settings: null, tickets: [], view: 'tickets',
-  scoresLeague: 'NFL', scoresCache: {}, boardDate: null,
-  newsLeague: 'NFL',
+  user: null, settings: null, tickets: [], view: 'home',
+  scoresLeague: 'ALL', scoresCache: {}, boardDate: null,
+  newsLeague: 'ALL', newsLimit: 8,
+  homeTab: 'tickets', scoresSeg: 'live', ticketSeg: 'current', boardSeg: 'friends', peopleCache: null, lastDetail: null,
   detailCache: new Map(), blockTab: new Map(), fullPlays: new Set(), expandedBlocks: new Set(),
   alerts: null, communityCache: null,
 };
@@ -54,12 +59,21 @@ const state = {
 const MORE_VIEWS = ['props', 'news', 'bankroll', 'account'];
 function renderMore() { /* static menu lives in index.html (#view-more) */ }
 function showView(name) {
+  // Home is a composite: Sports News on top, then the My Tickets or Community panel.
+  if (name === 'tickets') { state.homeTab = 'tickets'; name = 'home'; }
+  else if (name === 'community') { state.homeTab = 'community'; name = 'home'; }
+  else if (name === 'news') { name = 'home'; }
   state.view = name;
   $$('.view').forEach((v) => { v.hidden = v.id !== `view-${name}`; });
-  $$('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.nav === (MORE_VIEWS.includes(name) ? 'more' : name)));
+  if (name === 'home') {
+    $('#view-tickets').hidden = state.homeTab !== 'tickets';
+    $('#view-community').hidden = state.homeTab !== 'community';
+  }
+  $$('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.nav === name));
   window.scrollTo(0, 0);
   render();
 }
+function setHomeTab(tab) { state.homeTab = tab; showView('home'); }
 $$('.nav-btn').forEach((b) => b.addEventListener('click', () => showView(b.dataset.nav)));
 $('#alerts-bell').addEventListener('click', () => { showView('account'); setTimeout(() => { const el = $('#alerts-center'); if (el) el.scrollIntoView({ behavior: 'smooth' }); }, 60); });
 
@@ -69,6 +83,7 @@ async function refreshMe() {
     state.user = d.user; state.settings = d.settings || null;
   } catch { state.user = null; }
   $('#alerts-bell').hidden = !state.user;
+  renderProfileChip();
   refreshAlertBadge();
 }
 async function refreshAlertBadge() {
@@ -82,7 +97,8 @@ async function refreshAlertBadge() {
 }
 function render() {
   refreshAlertBadge();
-  ({ tickets: renderTickets, scores: renderScores, props: renderProps, news: renderNews, community: renderCommunity, board: renderBoard, bankroll: renderBankroll, account: renderAccount, more: renderMore })[state.view]();
+  renderProfileChip();
+  ({ home: renderHome, tickets: renderTickets, scores: renderScores, props: renderProps, news: renderNews, community: renderCommunity, board: renderBoard, people: renderPeople, bankroll: renderBankroll, account: renderAccount, more: renderMore })[state.view]();
 }
 
 /* ================= TICKETS ================= */
@@ -125,8 +141,10 @@ function situationHTML(game, detail) {
   const isBaseball = ['MLB'].includes(g.league);
   const isFootball = ['NFL', 'NCAAF'].includes(g.league);
   if (isFootball && (g.downDistanceText || (detail && detail.downDistanceText))) {
-    html += `<div class="card tight" style="margin-top:10px"><div class="small" style="color:var(--mint);font-weight:800">ON OFFENSE — ${esc(g.possessionAbbr || '')}</div>
-      <div>${esc((detail && detail.downDistanceText) || g.downDistanceText || '')}</div>
+    const yl = detail && detail.yardLine !== null && detail.yardLine !== undefined ? detail.yardLine : (g.yardLine !== null && g.yardLine !== undefined ? g.yardLine : null);
+    html += `<div class="card tight" style="margin-top:10px"><div class="row between"><span class="small" style="color:var(--mint);font-weight:800">ON OFFENSE</span>${g.possessionAbbr ? '<span class="pill on">POSSESSION</span>' : ''}</div>
+      <div style="font-weight:800;margin-top:4px">${esc(g.possessionAbbr || '')}${g.possessionAbbr ? ' · ' : ''}${esc((detail && detail.downDistanceText) || g.downDistanceText || '')}</div>
+      ${yl !== null ? `<div class="field-strip"><div class="field-ball" style="left:${Math.max(2, Math.min(98, Number(yl) || 0))}%"></div></div><div class="small muted" style="margin-top:4px">Ball at the ${esc(String(yl))}</div>` : ''}
       <div class="small muted">${esc((detail && detail.driveText) || g.situationText || g.lastPlayText || '')}</div></div>`;
   }
   if (isBaseball && g.state === 'in') {
@@ -144,8 +162,8 @@ function gameHeaderHTML(game, league, gameLabel) {
   const winner = game.state === 'post' ? (game.home.score > game.away.score ? 'home' : game.away.score > game.home.score ? 'away' : '') : '';
   return `<div class="game-head"><div class="small muted">${esc(league)} · ${game.state === 'in' ? `<span class="status-live">LIVE ${esc(game.detail)}</span>` : esc(game.detail || fmtDateTime(game.start))}</div>
     ${game.state === 'in' ? '<span class="pill live">Live</span>' : game.state === 'post' ? '<span class="pill">Final</span>' : `<span class="pill">${esc(fmtDateTime(game.start))}</span>`}</div>
-    <div class="team-line ${winner === 'away' ? 'win' : ''}"><span>${esc(game.away.abbr)} ${esc(game.away.name)}</span><span class="score">${game.away.score ?? ''}</span></div>
-    <div class="team-line ${winner === 'home' ? 'win' : ''}"><span>${esc(game.home.abbr)} ${esc(game.home.name)}</span><span class="score">${game.home.score ?? ''}</span></div>`;
+    <div class="team-line ${winner === 'away' ? 'win' : ''}"><span class="row" style="gap:7px">${game.away.logo ? `<img src="${esc(game.away.logo)}" alt="" style="width:22px;height:22px;object-fit:contain" loading="lazy" onerror="this.remove()">` : ''}<span>${esc(game.away.abbr)} ${esc(game.away.name)}</span></span><span class="score">${game.away.score ?? ''}</span></div>
+    <div class="team-line ${winner === 'home' ? 'win' : ''}"><span class="row" style="gap:7px">${game.home.logo ? `<img src="${esc(game.home.logo)}" alt="" style="width:22px;height:22px;object-fit:contain" loading="lazy" onerror="this.remove()">` : ''}<span>${esc(game.home.abbr)} ${esc(game.home.name)}</span></span><span class="score">${game.home.score ?? ''}</span></div>`;
 }
 function linescoreHTML(detail) {
   if (!detail || !detail.linescores || !detail.linescores.length) return '';
@@ -160,15 +178,18 @@ function detailTabsHTML(blockId, league, eventId) {
   let body = '<div class="small muted" style="padding:8px 0">Loading game detail…</div>';
   if (d) {
     if (tab === 'plays') {
-      const plays = state.fullPlays.has(blockId) ? d.plays : d.plays.slice(0, 5);
-      body = `<div class="small" style="color:var(--mint);font-weight:800;margin-top:10px">RECENT PLAYS</div>` +
-        (plays.length ? plays.map((pl) => `<div class="play ${pl.scoringPlay ? 'scoring' : ''}"><div class="meta">${esc(pl.periodLabel)} · ${esc(pl.clock)} ${pl.teamAbbr ? '· ' + esc(pl.teamAbbr) : ''} ${pl.category ? '· ' + esc(pl.category.toUpperCase()) : ''}</div><div class="txt">${pl.playersLine ? `<span class="muted">${esc(pl.playersLine)}</span><br>` : ''}${esc(pl.text)}</div></div>`).join('') : '<div class="small muted" style="padding:8px 0">No plays in the feed yet.</div>') +
-        (d.plays.length > 5 ? `<button class="btn secondary small" style="margin-top:8px" onclick="toggleFullPlays('${blockId}')">${state.fullPlays.has(blockId) ? 'Show recent only' : `Full play-by-play — all ${d.plays.length} plays`}</button>` : '');
+      const playCard = (pl, cls) => `<div class="play ${cls || ''} ${pl.scoringPlay ? 'scoring' : ''}"><div class="meta">${esc(pl.periodLabel)}${pl.clock ? ' · ' + esc(pl.clock) : ''} ${pl.teamAbbr ? '· ' + esc(pl.teamAbbr) : ''} ${pl.category ? `<span class="cat-chip">${esc(pl.category.toUpperCase())}</span>` : ''}</div><div class="txt">${pl.playersLine ? `<span class="muted">${esc(pl.playersLine)}</span><br>` : ''}${esc(pl.text)}</div></div>`;
+      const full = state.fullPlays.has(blockId);
+      const recent = full ? d.plays.slice(1) : d.plays.slice(1, 5);
+      body = (d.plays.length ? `<div class="small" style="color:var(--mint);font-weight:800;margin-top:10px">LATEST PLAY</div>${playCard(d.plays[0], 'latest')}` +
+        (recent.length ? `<div class="small" style="color:var(--mint);font-weight:800;margin-top:12px">RECENT PLAYS</div>${recent.map((pl) => playCard(pl)).join('')}` : '') : '<div class="small muted" style="padding:8px 0">No plays in the feed yet.</div>') +
+        (d.plays.length > 5 ? `<button class="btn secondary small" style="margin-top:8px" onclick="toggleFullPlays('${blockId}')">${full ? 'Show recent only' : `Full play-by-play — all ${d.plays.length} plays`}</button>` : '');
     } else if (tab === 'stats') {
       const teamStats = d.teamStats && d.teamStats.length
         ? `<table class="lines"><tr><th>Stat</th>${d.statTeamAbbrs.map((a) => `<th>${esc(a)}</th>`).join('')}</tr>${d.teamStats.map((s) => `<tr><td>${esc(s.label)}</td>${s.values.map((v) => `<td>${esc(v)}</td>`).join('')}</tr>`).join('')}</table>` : '<div class="small muted" style="padding:8px 0">No team stats in the feed.</div>';
       const leaders = d.leaders && d.leaders.length ? `<div class="small" style="color:var(--mint);font-weight:800;margin-top:10px">GAME LEADERS</div>${d.leaders.map((l) => `<div class="kv"><span>${esc(l.team)} · ${esc(l.label)}</span><span>${esc(l.value)}</span></div>`).join('')}` : '';
-      body = teamStats + leaders;
+      const playerStats = d.playerStats && d.playerStats.length ? `<div class="small" style="color:var(--mint);font-weight:800;margin-top:12px">PLAYER STATS</div>` + d.playerStats.map((gs) => `<div class="small" style="font-weight:800;margin-top:8px">${esc(gs.teamAbbr)}${gs.category ? ' — ' + esc(gs.category) : ''}</div><table class="lines"><tr><th>Player</th>${gs.columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr>${gs.rows.slice(0, 15).map((r) => `<tr><td>${esc(r.player)}</td>${r.values.map((v) => `<td>${esc(v)}</td>`).join('')}</tr>`).join('')}</table>`).join('') : '';
+      body = teamStats + playerStats + leaders;
     } else {
       body = d.scoringPlays && d.scoringPlays.length
         ? d.scoringPlays.map((pl) => `<div class="play scoring"><div class="meta">${esc(pl.periodLabel)} · ${esc(pl.clock)} · ${esc(pl.teamAbbr)} — ${esc(pl.awayScore)}–${esc(pl.homeScore)}</div><div class="txt">${esc(pl.text)}</div></div>`).join('')
@@ -190,7 +211,7 @@ async function ensureDetail(league, eventId) {
     const d = await api('GET', `/api/game?league=${encodeURIComponent(league)}&eventId=${encodeURIComponent(eventId)}`);
     d.at = Date.now();
     state.detailCache.set(key, d);
-    if (state.view === 'tickets' || state.view === 'scores') render();
+    render();
   } catch { /* keep stale */ }
 }
 function setBlockTab(blockId, tab) { state.blockTab.set(blockId, tab); render(); }
@@ -370,22 +391,34 @@ function ticketCardHTML(t) {
     ${t.notes ? `<div class="small muted" style="margin-top:10px">${esc(t.notes)}</div>` : ''}${t.hasImage ? `<img class="ticket-img" src="/api/tickets/${t.id}/image" alt="Ticket screenshot">` : ''}
   </div>`;
 }
+function ticketIsSettledBucket(t) {
+  // Spec (video): settled tickets move to Settled 12 hours after their verified result.
+  if (t.status === 'open' || !t.settledAt) return false;
+  return Date.now() - new Date(t.settledAt).getTime() >= 12 * 3600 * 1000;
+}
 function filteredTickets() {
   if (!state.expandedTickets) state.expandedTickets = new Set();
-  const f = state.ticketFilter || 'all';
-  if (f === 'all') return state.tickets;
-  return state.tickets.filter((t) => classifyTicket(t) === f);
+  return state.tickets.filter((t) => state.ticketSeg === 'settled' ? ticketIsSettledBucket(t) : !ticketIsSettledBucket(t));
 }
 async function renderTickets() {
   const el = $('#view-tickets');
-  if (!state.user) { el.innerHTML = '<h2>Your Tickets</h2>' + signInPromptHTML('Sign in to add tickets and sweat them live, play by play.'); return; }
-  if (!$('#tickets-list')) el.innerHTML = `<div class="row between"><h2>Your Tickets</h2><button class="btn" onclick="openAddTicket()">+ Add Ticket</button></div><div id="tickets-list"><div class="empty">Loading…</div></div>`;
+  if (!state.user) { el.innerHTML = signInPromptHTML('Sign in to add tickets and sweat them live, play by play.'); return; }
+  el.innerHTML = `<div class="row" style="gap:10px;align-items:center">
+      <button class="add-ticket-big" onclick="openAddTicket()"><span class="plus">+</span><span>Add Ticket</span></button>
+      <button class="share-sq" onclick="openShareSheet()" aria-label="Share a ticket">⬆</button></div>
+    <div class="seg-wrap"><div class="seg">
+      <button class="${state.ticketSeg === 'current' ? 'on' : ''}" onclick="setTicketSeg('current')">Current</button>
+      <button class="${state.ticketSeg === 'settled' ? 'on' : ''}" onclick="setTicketSeg('settled')">Settled</button>
+    </div><button class="icon-btn" style="width:38px;height:38px;font-size:16px;flex:none" onclick="renderTickets()" aria-label="Refresh tickets">⟳</button></div>
+    <div class="small muted">Settled tickets move to Settled 12 hours after their verified result.</div>
+    <div id="tickets-list"><div class="empty">Loading…</div></div>`;
   try {
     await loadTickets();
+    renderHomeTabs();
     renderTicketsLight();
     state.propCache = state.propCache || {};
     for (const t of state.tickets.filter((x) => x.status === 'open')) {
-      api('GET', `/api/props?ticketId=${t.id}`).then((d) => { state.propCache[t.id] = d.props || []; if (state.view === 'tickets') renderTicketsLight(); }).catch(() => {});
+      api('GET', `/api/props?ticketId=${t.id}`).then((d) => { state.propCache[t.id] = d.props || []; if (state.view === 'home') renderTicketsLight(); }).catch(() => {});
     }
   } catch (e) {
     const l = $('#tickets-list'); if (l) l.innerHTML = `<div class="err">${esc(e.message)}</div>`;
@@ -394,15 +427,13 @@ async function renderTickets() {
 function renderTicketsLight() {
   const list = $('#tickets-list');
   if (!list) return;
-  const counts = { all: state.tickets.length, upcoming: 0, live: 0, finished: 0, lost: 0 };
-  for (const t of state.tickets) counts[classifyTicket(t)]++;
-  const f = state.ticketFilter || 'all';
-  const chip = (key, label) => `<button class="fchip ${f === key ? 'on' : ''}" onclick="setTicketFilter('${key}')">${label}${key === 'live' && counts.live ? ` <span class="fchip-n">${counts.live}</span>` : ''}</button>`;
-  const chips = `<div class="row" style="gap:8px;margin-bottom:12px;flex-wrap:wrap">${chip('all', 'All')}${chip('upcoming', 'Upcoming')}${chip('live', 'Live')}${chip('finished', 'Finished')}${chip('lost', 'Lost')}</div>`;
+  // Keep the segmented control's active state in sync after light re-renders.
+  $$('#view-tickets .seg button').forEach((b) => b.classList.toggle('on', b.textContent.trim().toLowerCase() === state.ticketSeg));
   const vis = filteredTickets();
-  list.innerHTML = chips + (vis.length ? vis.map(ticketCardHTML).join('') : '<div class="card"><div class="empty">No tickets in this bucket yet.</div></div>');
+  list.innerHTML = vis.length ? vis.map(ticketCardHTML).join('') : `<div class="dashed-empty">${state.ticketSeg === 'settled' ? 'Nothing settled yet — settled tickets land here 12 hours after their verified result.' : 'No current tickets.<br>Tap + Add Ticket to sweat your first one.'}</div>`;
   if (state.expandedTickets) for (const t of vis) if (state.expandedTickets.has(t.id)) for (const g of groupLegsByGame(t)) if (g.eventId) ensureDetail(g.league, g.eventId);
 }
+function setTicketSeg(seg) { state.ticketSeg = seg; renderTicketsLight(); }
 async function deleteTicket(id, btn) {
   if (!armButton(btn, 'Tap again to DELETE')) return;
   try {
@@ -696,12 +727,13 @@ async function saveTicket() {
 /* ================= SCORES ================= */
 async function renderScores() {
   const el = $('#view-scores');
-  if (!$('#scores-list')) {
-    const chips = LEAGUES.map((l) => `<button class="chip ${state.scoresLeague === l ? 'on' : ''}" onclick="setScoresLeague('${l}')">${l}</button>`).join('');
-    el.innerHTML = `<h2>Scores</h2><div class="chips">${chips}</div><div id="your-games"></div><div id="scores-list"><div class="empty">Loading scores…</div></div>`;
-  } else {
-    $$('.chip', el).forEach((c) => c.classList.toggle('on', c.textContent === state.scoresLeague));
-  }
+  const pillLabel = (l) => l === 'ALL' ? 'All leagues' : l === 'SOCCER' ? 'Soccer' : l;
+  const chips = SCORE_PILLS.map((l) => `<button class="chip ${state.scoresLeague === l ? 'on' : ''}" onclick="setScoresLeague('${l}')">${pillLabel(l)}</button>`).join('');
+  const segBtn = (key, label) => `<button class="${state.scoresSeg === key ? 'on' : ''}" onclick="setScoresSeg('${key}')">${label}</button>`;
+  el.innerHTML = `<div class="row between"><h2 style="margin:0">Live Scores</h2><span class="row"><span id="scores-live-count" class="live-count"></span><button class="icon-btn" style="width:38px;height:38px;font-size:16px" onclick="renderScores()" aria-label="Refresh scores">⟳</button></span></div>
+    <div class="chips" style="margin-top:12px">${chips}</div>
+    <div class="seg" style="margin-bottom:12px">${segBtn('live', 'Live now')}${segBtn('upcoming', 'Upcoming')}${segBtn('today', 'Today')}</div>
+    <div id="your-games"></div><div id="scores-list"><div class="empty">Loading scores…</div></div>`;
   // Your games first
   if (state.user) {
     try {
@@ -716,18 +748,60 @@ async function renderScores() {
     } catch { /* ignore */ }
   }
   try {
-    const d = await api('GET', `/api/scores?league=${state.scoresLeague}`);
+    const d = await loadScores(state.scoresLeague);
     state.scoresCache[state.scoresLeague] = d;
     const list = $('#scores-list');
     if (!list) return;
     if (d.error) { list.innerHTML = `<div class="err">${esc(d.error)}</div>`; return; }
-    list.innerHTML = `<h3>${esc(state.scoresLeague)}</h3>` + (d.games.length ? d.games.map((g) => `<div class="card tight" onclick="openGameDetail('${g.league}','${g.id}')" style="cursor:pointer">${gameHeaderHTML(g, g.league)}</div>`).join('') : '<div class="card"><div class="empty">No games in the window.</div></div>') +
-      `<div class="small muted">Updated ${fmtDateTime(d.fetchedAt)}</div>`;
+    const liveN = d.games.filter((g) => g.state === 'in').length;
+    const lc = $('#scores-live-count'); if (lc) lc.textContent = `● ${liveN} live game${liveN === 1 ? '' : 's'}`;
+    const segGames = d.games.filter((g) => state.scoresSeg === 'live' ? g.state === 'in' : state.scoresSeg === 'upcoming' ? g.state === 'pre' : true);
+    const grid = state.scoresLeague === 'ALL';
+    const cards = segGames.map((g) => `<div class="card tight" onclick="openGameDetail('${g.league}','${g.id}')" style="cursor:pointer">${scoreCardHTML(g)}</div>`).join('');
+    list.innerHTML = (segGames.length ? (grid ? `<div class="score-grid">${cards}</div>` : cards) : `<div class="card"><div class="empty">${state.scoresSeg === 'live' ? 'No live games right now.' : state.scoresSeg === 'upcoming' ? 'No upcoming games in the window.' : 'No games in the window.'}</div></div>`)
+      + `<div class="small muted" style="margin-top:10px">Updated ${fmtDateTime(d.fetchedAt)}</div>`;
+    // Soccer cards show goal scorers from the detail feed once it lands (ensureDetail re-renders).
+    for (const g of segGames) if (isSoccerLeague(g.league) && g.state !== 'pre') ensureDetail(g.league, g.id);
   } catch (e) {
     const list = $('#scores-list'); if (list) list.innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
 }
 function setScoresLeague(l) { state.scoresLeague = l; renderScores(); }
+function setScoresSeg(s) { state.scoresSeg = s; renderScores(); }
+function isSoccerLeague(l) { return l === 'MLS' || l === 'EPL' || l === 'SOCCER'; }
+function scoreSort(a, b) {
+  const r = (g) => g.state === 'in' ? 0 : g.state === 'pre' ? 1 : 2;
+  const d = r(a) - r(b);
+  if (d) return d;
+  return a.state === 'post' ? String(b.start || '').localeCompare(String(a.start || '')) : String(a.start || '').localeCompare(String(b.start || ''));
+}
+async function loadScores(league) {
+  if (SCORE_FETCH[league]) {
+    const parts = await Promise.all(SCORE_FETCH[league].map((l) => api('GET', `/api/scores?league=${l}`).catch(() => ({ games: [] }))));
+    return { games: parts.flatMap((x) => x.games || []).sort(scoreSort), fetchedAt: new Date().toISOString(), error: '' };
+  }
+  return api('GET', `/api/scores?league=${league}`);
+}
+function scoreCardHTML(g) {
+  const winner = g.state === 'post' ? (g.home.score > g.away.score ? 'home' : g.away.score > g.home.score ? 'away' : '') : '';
+  const stateTag = g.state === 'in' ? '<span class="status-live">LIVE</span>' : g.state === 'post' ? '<span class="muted">FINAL</span>' : `<span class="muted">${esc(fmtDateTime(g.start))}</span>`;
+  const price = (key) => g.odds ? (key === 'away' ? g.odds.awayML : g.odds.homeML) : null;
+  const teamRow = (side, key) => `<div class="team-line ${winner === key ? 'win' : ''}"><span class="row" style="gap:7px">${side.logo ? `<img src="${esc(side.logo)}" alt="" style="width:20px;height:20px;object-fit:contain" loading="lazy" onerror="this.remove()">` : ''}<span>${esc(side.abbr)}${g.state === 'in' && g.possessionAbbr === side.abbr ? ' 👁' : ''}</span></span><span class="score">${g.state === 'pre' && price(key) ? esc(price(key)) : (side.score ?? '')}</span></div>`;
+  let scorers = '';
+  if (isSoccerLeague(g.league) && g.state !== 'pre') {
+    const d = state.detailCache.get(String(g.id));
+    if (d && d.scoringPlays && d.scoringPlays.length) scorers = d.scoringPlays.map((pl) => `<div class="scorer-line">⚽ ${esc(pl.clock || '')} ${esc(pl.teamAbbr || '')} — ${esc(String(pl.text || '').slice(0, 70))}</div>`).join('');
+  }
+  return `<div class="game-head"><div class="small muted">${esc(g.league)}${isSoccerLeague(g.league) ? '' : ''}</div>${stateTag}</div>
+    ${teamRow(g.away, 'away')}
+    ${teamRow(g.home, 'home')}
+    ${scorers}
+    ${g.state === 'in' && g.downDistanceText ? `<div class="small" style="color:var(--mint);font-weight:700;margin-top:4px">${esc(g.downDistanceText)}${g.possessionAbbr ? ' · ' + esc(g.possessionAbbr) : ''}</div>` : ''}
+    ${g.state === 'pre' && g.odds && (g.odds.awayML || g.odds.homeML) ? `<div class="small" style="margin-top:4px"><span style="color:var(--mint);font-weight:700">Listed ML${g.odds.provider ? ' · ' + esc(g.odds.provider) : ''}</span> <span class="muted">${esc(g.away.abbr)} ${esc(g.odds.awayML || '—')} · ${esc(g.home.abbr)} ${esc(g.odds.homeML || '—')}${g.odds.drawML ? ` · Draw ${esc(g.odds.drawML)}` : ''}</span></div>` : ''}
+    <div class="tiny muted" style="margin-top:5px">🕐 ${g.state === 'pre' ? 'Scheduled' : esc(g.detail || '')} · ESPN · ${esc(fmtDateTime(g.start))}</div>
+    ${g.broadcasts && g.broadcasts.length ? `<div class="watch-line"><b>Watch</b> ${esc(g.broadcasts.join(' · '))}</div>` : ''}
+    <div class="small" style="color:var(--mint);font-weight:700;margin-top:4px">Game details</div>`;
+}
 
 /* ================= NEWS ================= */
 /* ================= PROPS ================= */
@@ -739,7 +813,7 @@ function isBoardPropPlay(pl) {
 }
 async function renderProps() {
   const el = $('#view-props');
-  el.innerHTML = `<h2>Player Props</h2><div id="props-body"><div class="empty">Loading props…</div></div>`;
+  el.innerHTML = `<h2>Player Props</h2><div class="small muted" style="margin:-6px 2px 2px">Top rated · All leagues</div><div id="props-body"><div class="empty">Loading props…</div></div>`;
   const body = () => $('#props-body');
   try {
     let mine = [];
@@ -761,49 +835,74 @@ async function renderProps() {
       ${p.available ? `<div class="small" style="margin-top:5px"><strong>${esc(p.display || '')}</strong>${p.progress !== null && p.progress !== undefined ? `<div class="propbar"><div style="width:${p.progress}%"></div></div>` : ''}<span class="muted">${esc(p.remaining || '')}</span></div>` : `<div class="small muted" style="margin-top:5px">${esc(p.statusText || '')}</div>`}
       <div class="small muted" style="margin-top:4px">On: ${esc(p.ticketTitle || 'a ticket')}</div>
     </div>`;
-    const boardCard = (pl) => `<div class="card tight"><div class="row between"><strong>${esc(pl.play)}</strong><span>${pl.odds !== null && pl.odds !== undefined ? fmtOdds(pl.odds) : ''}</span></div>
-      <div class="small muted">${esc(pl.league)}${pl.market ? ' · ' + esc(pl.market) : ''} · ${esc(pl.sportsbook)}${pl.tier !== 'watch' ? ' · <span style="color:var(--mint)">Actionable</span>' : ' · Watch'}</div>
-      ${pl.edgeNote ? `<div class="small" style="margin-top:4px">${esc(pl.edgeNote)}</div>` : ''}
-      ${pl.verified ? `<div class="small" style="color:var(--mint);margin-top:4px">✓ Verified on Hard Rock Bet${pl.verifiedAt ? ' · ' + fmtDateTime(pl.verifiedAt) : ''}</div>` : ''}</div>`;
+    const live = mine.filter((p) => p.gameState === 'in');
+    const ranked = boardProps.map((pl, i) => `<div class="card tight">
+      <div class="row between"><span class="row" style="gap:9px"><span class="rank-n">#${i + 1}</span><strong>${esc(pl.play)}</strong></span><span class="hr-odds">${pl.odds !== null && pl.odds !== undefined ? fmtOdds(pl.odds) : ''}</span></div>
+      <div class="small muted" style="margin-top:3px">${esc(pl.league)}${pl.market ? ' · ' + esc(pl.market) : ''} · ${esc(pl.sportsbook)} · ${pl.tier !== 'watch' ? '<span style="color:var(--mint);font-weight:800">Actionable · +EV</span>' : 'Watch list'}</div>
+      ${pl.edgeNote ? `<div class="small" style="margin-top:5px">${esc(pl.edgeNote)}</div>` : ''}
+      ${pl.verified ? `<div class="small" style="color:var(--mint);margin-top:4px">✓ Verified on Hard Rock Bet${pl.verifiedAt ? ' · ' + fmtDateTime(pl.verifiedAt) : ''}</div>` : ''}</div>`).join('');
     body().innerHTML = `
-      <h3>Your props — live</h3>
+      ${state.user ? `<h3>Live player progress</h3>
+      ${live.length ? live.map(myCard).join('') : `<div class="card"><div class="empty">No live player props right now.<br>When one of your prop legs is in a live game, its progress sweats here.</div></div>`}` : ''}
+      <h3>Top rated props${boardDate ? ` · ${fmtDay(boardDate)}` : ''}</h3>
+      ${boardProps.length ? ranked : `<div class="card"><div class="empty">No player props on today's Board — today was all sides and totals.<br>When the morning Board carries props, they rank here with the verified Hard Rock line.</div></div>`}
+      <h3 style="margin-top:18px">Your props</h3>
       ${!state.user ? `<div class="card"><div class="empty">Sign in to sweat your prop legs here.<br><button class="btn" style="margin-top:8px" onclick="showView('account')">Sign in</button></div></div>`
         : mine.length ? mine.map(myCard).join('') : `<div class="card"><div class="empty">No player props on your open tickets right now.<br>Any ticket you add with a player prop leg — screenshot or typed — sweats here live with a progress bar.</div></div>`}
-      <h3 style="margin-top:18px">Today's prop plays — from the Board${boardDate ? ` · ${fmtDay(boardDate)}` : ''}</h3>
-      ${boardProps.length ? boardProps.map(boardCard).join('') : `<div class="card"><div class="empty">No player props on today's Board — today was all sides and totals.<br>When the morning Board carries props, they land here with the verified Hard Rock line.</div></div>`}`;
+      <div class="card"><div class="small" style="color:var(--mint);font-weight:800">HOW THESE ARE PICKED</div>
+      <div class="small muted" style="margin-top:5px">Every target on this page comes off the morning Sweat With Wilk Board and is re-verified on Hard Rock Bet before it posts — Hard Rock is the only book these plays are priced on. Edges are analysis, not guarantees: a prop still has to be played to hit. Set limits, take breaks, and never chase losses.</div></div>
+      ${rgFooterHTML()}`;
   } catch (e) {
     body().innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
 }
 
 async function renderNews() {
-  const el = $('#view-news');
-  if (!$('#news-list')) {
-    const chips = LEAGUES.map((l) => `<button class="chip ${state.newsLeague === l ? 'on' : ''}" onclick="setNewsLeague('${l}')">${l}</button>`).join('');
-    el.innerHTML = `<h2>Sports News</h2><div class="small muted" style="margin:-6px 2px 12px">The latest from ESPN — injuries, trades, and the storylines that move lines. Know what's going on before you sweat it.</div><div class="chips">${chips}</div><div id="news-list"><div class="empty">Loading news…</div></div>`;
-  } else {
-    $$('.chip', el).forEach((c) => c.classList.toggle('on', c.textContent === state.newsLeague));
-  }
+  const el = $('#home-news');
+  if (!el) return;
+  const label = (l) => l === 'ALL' ? 'All leagues' : l === 'SOCCER' ? 'Soccer' : l;
+  const chips = NEWS_LEAGUES.map((l) => `<button class="chip ${state.newsLeague === l ? 'on' : ''}" onclick="setNewsLeague('${l}')">${label(l)}</button>`).join('');
+  el.innerHTML = `<div class="row between"><h2 style="margin:0">📰 Sports News</h2><button class="icon-btn" style="width:38px;height:38px;font-size:16px" onclick="renderNews()" aria-label="Refresh news">⟳</button></div>
+    <div class="chips" style="margin-top:12px">${chips}</div><div id="news-list"><div class="empty">Loading news…</div></div>`;
   try {
-    const d = await api('GET', `/api/news?league=${state.newsLeague}`);
+    const items = await loadNews(state.newsLeague);
     const list = $('#news-list');
     if (!list) return;
-    if (d.error) { list.innerHTML = `<div class="err">${esc(d.error)}</div>`; return; }
-    list.innerHTML = (d.items.length ? d.items.map((a) => `
-      <div class="card tight">
-        ${a.url ? `<a class="news-head" href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.headline)}</a>` : `<div class="news-head">${esc(a.headline)}</div>`}
-        ${a.description ? `<div class="small" style="margin-top:4px">${esc(a.description)}</div>` : ''}
-        <div class="tiny muted" style="margin-top:6px">${esc(a.source || 'ESPN')} · ${esc(fmtDateTime(a.published))}</div>
+    const shown = items.slice(0, state.newsLimit);
+    list.innerHTML = (shown.length ? shown.map((a) => `
+      <div class="card tight news-card">
+        ${a.image ? `<img class="news-thumb" src="${esc(a.image)}" alt="" loading="lazy" onerror="this.remove()">` : ''}
+        <div style="flex:1;min-width:0">
+          <div class="row between"><span class="news-tag">${esc(a._leagueLabel || '')}</span><span class="tiny muted">${esc(fmtDateTime(a.published))}</span></div>
+          ${a.url ? `<a class="news-head" href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.headline)}</a>` : `<div class="news-head">${esc(a.headline)}</div>`}
+          <div class="tiny muted" style="margin-top:5px">ESPN · Read story</div>
+        </div>
       </div>`).join('') : '<div class="card"><div class="empty">No headlines right now.</div></div>')
-      + `<div class="small muted">Updated ${fmtDateTime(d.fetchedAt)}</div>`;
+      + (items.length > state.newsLimit ? `<button class="btn secondary" style="width:100%" onclick="state.newsLimit+=10;renderNews()">More headlines</button>` : '')
+      + `<div class="small muted" style="margin-top:8px">Updated ${fmtDateTime(new Date().toISOString())}</div>`;
   } catch (e) {
     const list = $('#news-list'); if (list) list.innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
 }
-function setNewsLeague(l) { state.newsLeague = l; renderNews(); }
+async function loadNews(league) {
+  const label = (l) => l === 'MLS' ? 'Soccer' : l;
+  if (NEWS_FETCH[league]) {
+    const parts = await Promise.all(NEWS_FETCH[league].map((l) => api('GET', `/api/news?league=${l}`).then((d) => ({ l, items: d.items || [] })).catch(() => ({ l, items: [] }))));
+    const seen = new Set(); const out = [];
+    for (const p of parts) for (const a of p.items) { const k = a.id || a.headline; if (seen.has(k)) continue; seen.add(k); out.push({ ...a, _leagueLabel: label(p.l) }); }
+    out.sort((x, y) => String(y.published || '').localeCompare(String(x.published || '')));
+    return out;
+  }
+  const fetchLeague = league === 'SOCCER' ? 'MLS' : league;
+  const d = await api('GET', `/api/news?league=${fetchLeague}`);
+  if (d.error) throw new Error(d.error);
+  return (d.items || []).map((a) => ({ ...a, _leagueLabel: label(fetchLeague) }));
+}
+function setNewsLeague(l) { state.newsLeague = l; state.newsLimit = 8; renderNews(); }
 async function openGameDetail(league, eventId) {
   const blockId = `score-${eventId}`;
-  openSheet(`<h3>Game Detail</h3><div id="gd-body"><div class="empty">Loading…</div></div><button class="btn secondary" style="margin-top:12px" onclick="closeSheet()">Close</button>`);
+  state.lastDetail = { league, eventId };
+  openSheet(`<div class="row between"><h3 style="margin:0">Game details</h3><button class="close-pill" onclick="closeSheet()">✕ Close</button></div><div id="gd-body"><div class="empty">Loading…</div></div>`);
   try {
     const d = await api('GET', `/api/game?league=${encodeURIComponent(league)}&eventId=${encodeURIComponent(eventId)}`);
     d.at = Date.now();
@@ -811,20 +910,51 @@ async function openGameDetail(league, eventId) {
     const g = d.game || null;
     const body = $('#gd-body');
     if (!body) return;
-    body.innerHTML = `${gameHeaderHTML(g, league)}
+    const stateLabel = !g ? '' : g.state === 'in' ? 'LIVE' : g.state === 'post' ? 'FINAL' : esc(fmtDateTime(g.start));
+    const scorers = isSoccerLeague(league) && d.scoringPlays && d.scoringPlays.length ? `<div style="margin-top:6px">${d.scoringPlays.map((pl) => `<div class="scorer-line">⚽ ${esc(pl.clock || '')} ${esc(pl.teamAbbr || '')} — ${esc(pl.text || '')}</div>`).join('')}</div>` : '';
+    body.innerHTML = `<div class="gd-top"><span class="gd-brand">SWEAT WITH WILK</span>${state.user && g ? `<button class="icon-btn" style="width:36px;height:36px;font-size:16px" onclick="toggleSheetGameAlert('${esc(String(eventId))}')" aria-label="Game alerts">🔔</button>` : '<span></span>'}<span class="small muted">${esc(league)} ${stateLabel}</span></div>
+      ${g && g.broadcasts && g.broadcasts.length ? `<div class="small" style="text-align:center;margin-bottom:6px">Watch: ${esc(g.broadcasts.join(' · '))}</div>` : ''}
+      ${gameHeaderHTML(g, league)}
+      ${scorers}
       ${linescoreHTML(d)}
       ${situationHTML(g, d)}
       ${winProbHTML(d.winProbHome !== null && d.winProbHome !== undefined && g ? { winProbHome: d.winProbHome, home: g.home, away: g.away } : null)}
+      ${gameAlertsPanelHTML(eventId)}
       ${detailTabsHTML(blockId, league, eventId)}`;
   } catch (e) {
     const body = $('#gd-body'); if (body) body.innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
 }
+function gameAlertsPanelHTML(eventId) {
+  if (!state.user || !state.alerts) return '';
+  const off = state.alerts.subs.some((s) => s.scope === 'game' && s.eventId === String(eventId) && !s.on);
+  return `<div class="card tight" style="margin-top:12px"><div class="small" style="color:var(--mint);font-weight:800">GAME ALERTS</div>
+    <div class="switch-row"><span>Game start</span><input type="checkbox" style="width:auto" ${off ? '' : 'checked'} onchange="toggleSheetGameAlert('${esc(String(eventId))}')"></div>
+    <div class="switch-row"><span>Score — when either team scores</span><input type="checkbox" style="width:auto" ${off ? '' : 'checked'} onchange="toggleSheetGameAlert('${esc(String(eventId))}')"></div>
+    <div class="small muted" style="margin-top:6px">One switch covers this game — starts, scoring plays, and the final score — and alerts turn off when this game ends.</div></div>`;
+}
+async function toggleSheetGameAlert(eventId) {
+  if (!state.alerts) { showToast('Sign in to use game alerts.'); return; }
+  const off = state.alerts.subs.some((s) => s.scope === 'game' && s.eventId === String(eventId) && !s.on);
+  try {
+    await api('POST', '/api/alerts/toggle', { scope: 'game', eventId, on: off });
+    await refreshAlertBadge();
+    showToast(off ? 'Game alerts on for this game.' : 'Game alerts off for this game.');
+    const ld = state.lastDetail;
+    if (ld && String(ld.eventId) === String(eventId) && $('#gd-body')) openGameDetail(ld.league, ld.eventId);
+    else render();
+  } catch (e) { showToast(e.message); }
+}
 
 /* ================= BOARD ================= */
 async function renderBoard() {
   const el = $('#view-board');
-  el.innerHTML = `<h2>Today's Board</h2><div id="board-body"><div class="empty">Loading the Board…</div></div>`;
+  el.innerHTML = `<h2>Board</h2><div class="seg" style="margin-bottom:14px"><button class="${state.boardSeg === 'friends' ? 'on' : ''}" onclick="setBoardSeg('friends')">Friends' tickets</button><button class="${state.boardSeg === 'top30' ? 'on' : ''}" onclick="setBoardSeg('top30')">Top 30 Board</button></div><div id="board-body"><div class="empty">Loading…</div></div>`;
+  if (state.boardSeg === 'friends') return renderBoardFriends();
+  return renderBoardTop30();
+}
+function setBoardSeg(s) { state.boardSeg = s; renderBoard(); }
+async function renderBoardTop30() {
   try {
     const d = await api('GET', `/api/board${state.boardDate ? `?date=${state.boardDate}` : ''}`);
     state.boardDate = d.date;
@@ -841,10 +971,42 @@ async function renderBoard() {
       <div style="height:10px"></div>
       ${d.plays.length === 0 ? `<div class="card"><div class="empty">Today's Board hasn't landed yet — it lands by 7:00 AM ET.<br>Past boards stay archived by date and still count in your Bankroll.</div></div>` : ''}
       ${actionable.length ? `<h3>Actionable — +EV</h3>${actionable.map(playCard).join('')}` : ''}
-      ${watch.length ? `<h3>Watch</h3>${watch.map(playCard).join('')}` : ''}`;
+      ${watch.length ? `<h3>Watch</h3>${watch.map(playCard).join('')}` : ''}` + rgFooterHTML();
   } catch (e) {
     $('#board-body').innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
+}
+
+async function renderBoardFriends() {
+  const body = () => $('#board-body');
+  try {
+    const d = await api('GET', '/api/community');
+    state.communityCache = d;
+    const posts = (d.posts || []).filter((p) => p.kind === 'ticket' && p.ticket);
+    if (!body()) return;
+    body().innerHTML = `<div class="muted" style="margin-bottom:10px">Tickets friends and the room shared.</div>` +
+      (posts.length ? posts.map(friendTicketCardHTML).join('') : `<div class="dashed-empty">No friend tickets yet.<br>Find people in People to see their tickets here.</div>`) + rgFooterHTML();
+  } catch (e) {
+    if (body()) body().innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
+}
+function friendTicketCardHTML(post) {
+  const t = post.ticket;
+  const n = t.legs.length;
+  const badge = t.outcome === 'won' ? '<span class="pill outcome-win">WIN</span>' : t.outcome === 'lost' ? '<span class="pill outcome-loss">LOSS</span>' : t.outcome === 'push' ? '<span class="pill push">PUSH</span>' : '<span class="pill live">LIVE</span>';
+  const hit = t.legs.filter((l) => l.status === 'won').length;
+  const byGame = new Map();
+  for (const l of t.legs) { const k = l.gameLabel || l.league; if (!byGame.has(k)) byGame.set(k, []); byGame.get(k).push(l); }
+  const legRows = [...byGame.entries()].map(([label, legs]) => `<div style="margin-top:8px"><div class="small" style="font-weight:800">${esc(label)}</div>${legs.map((l) => `<div class="row between" style="margin-top:3px"><span class="small">${esc(l.selection)} <span class="muted">· ${esc(l.market)}${l.line ? ' ' + esc(l.line) : ''}</span></span><span class="row" style="gap:8px"><span class="odds-purple">${fmtOdds(l.odds)}</span>${l.status === 'won' ? '<span class="small" style="color:var(--mint);font-weight:800">✓ Hit</span>' : l.status === 'lost' ? '<span class="small" style="color:var(--red);font-weight:800">Missed</span>' : l.status === 'push' ? '<span class="small muted">Push</span>' : '<span class="small muted">···</span>'}</span></div>`).join('')}</div>`).join('');
+  const reactionLabel = { respect: 'Respect', tail: 'Tail it', hot: 'Hot take' };
+  return `<div class="card">
+    <div class="row between"><span class="row" style="gap:9px"><span class="avatar-c gray">${esc((post.authorName || '?').trim().charAt(0).toUpperCase())}</span><span><strong>${esc(post.authorName)}</strong><div class="tiny muted">🌐 Community</div></span></span><span class="tiny muted">${fmtDateTime(post.createdAt)}</span></div>
+    <div class="row" style="gap:8px;margin-top:10px"><span class="hr-badge">${n > 1 ? `${n}-LEG PARLAY` : 'SINGLE BET'}</span>${t.title ? `<span class="pill">${esc(t.title)}</span>` : ''}${badge}</div>
+    ${legRows}
+    <div style="margin-top:10px"><div class="row between small"><span class="muted">Leg progress</span><span><strong>${hit} / ${n}</strong> hit</span></div><div class="legprog"><div style="width:${n ? Math.round((hit / n) * 100) : 0}%"></div></div></div>
+    <div class="small" style="margin-top:10px">Wager <strong>${fmtMoney(t.stake)}</strong> · Potential return <strong>${fmtMoney(t.payout)}</strong> · <span class="odds-purple">${fmtOdds(t.combinedOdds)}</span></div>
+    <div class="row wrap" style="margin-top:10px">${post.reactions.map((r) => `<button class="reaction-btn ${r.mine ? 'on' : ''}" onclick="toggleReaction(${post.id},'${r.reaction}')">${reactionLabel[r.reaction]} · ${r.count}</button>`).join('')}</div>
+  </div>`;
 }
 
 /* ================= BANKROLL ================= */
@@ -874,7 +1036,7 @@ async function renderBankroll() {
 /* ================= COMMUNITY ================= */
 async function renderCommunity() {
   const el = $('#view-community');
-  el.innerHTML = '<h2>Community</h2><div id="comm-body"><div class="empty">Loading the room…</div></div>';
+  el.innerHTML = '<div id="comm-body"><div class="empty">Loading the room…</div></div>';
   try {
     const d = await api('GET', '/api/community');
     state.communityCache = d;
@@ -906,21 +1068,21 @@ async function renderCommunity() {
 async function createPost() {
   const body = $('#comm-new').value.trim();
   if (!body) return;
-  try { await api('POST', '/api/community/posts', { body }); renderCommunity(); } catch (e) { showToast(e.message); }
+  try { await api('POST', '/api/community/posts', { body }); render(); } catch (e) { showToast(e.message); }
 }
 async function addComment(postId) {
   const input = $(`#comment-${postId}`);
   const body = input.value.trim();
   if (!body) return;
-  try { await api('POST', `/api/community/posts/${postId}/comments`, { body }); renderCommunity(); } catch (e) { showToast(e.message); }
+  try { await api('POST', `/api/community/posts/${postId}/comments`, { body }); render(); } catch (e) { showToast(e.message); }
 }
 async function toggleReaction(postId, reaction) {
   if (!state.user) { showToast('Sign in to react.'); showView('account'); return; }
-  try { await api('POST', `/api/community/posts/${postId}/reactions`, { reaction }); renderCommunity(); } catch (e) { showToast(e.message); }
+  try { await api('POST', `/api/community/posts/${postId}/reactions`, { reaction }); render(); } catch (e) { showToast(e.message); }
 }
 async function deletePost(postId, btn) {
   if (!armButton(btn, 'Tap again to DELETE')) return;
-  try { await api('DELETE', `/api/community/posts/${postId}`); renderCommunity(); showToast('Post deleted.'); } catch (e) { showToast(e.message); }
+  try { await api('DELETE', `/api/community/posts/${postId}`); render(); showToast('Post deleted.'); } catch (e) { showToast(e.message); }
 }
 
 /* ================= ACCOUNT ================= */
@@ -1042,6 +1204,105 @@ async function saveQuiet() {
   const a = state.alerts; if (!a) return;
   await api('PUT', '/api/alerts/prefs', { prefs: a.prefs, quietStart: $('#q-start').value, quietEnd: $('#q-end').value });
   await refreshAlertBadge(); renderAccount();
+}
+
+/* ================= HOME / PROFILE / PEOPLE (video spec layer) ================= */
+function rgFooterHTML() {
+  return `<div class="rg-footer">
+    <div class="rg-brand">SWEAT WITH WILK</div>
+    <div><strong>Gamble responsibly.</strong></div>
+    <div class="small">Set limits. Take breaks. Never chase losses.</div>
+    <div class="small muted">Sweat With Wilk tracks tickets and never accepts or places wagers.</div>
+    <div class="small" style="margin-top:10px">Need support for a gambling problem?</div>
+    <div class="small"><a href="tel:18006973738">1-800-MY-RESET</a></div>
+    <div class="small muted">Florida: <a href="tel:18882364848">888-ADMIT-IT (888-236-4848)</a></div>
+    <div class="tiny muted" style="margin-top:10px">Privacy · Use &amp; community rules</div>
+  </div>`;
+}
+function renderProfileChip() {
+  const chip = $('#profile-chip');
+  if (!chip) return;
+  if (!state.user) {
+    chip.innerHTML = '<span class="chip-name">Sign in</span>';
+    chip.onclick = () => showView('account');
+    return;
+  }
+  const name = state.user.displayName || state.user.username || '?';
+  chip.innerHTML = `<span class="avatar-c">${esc(name.trim().charAt(0).toUpperCase())}</span><span class="chip-name">${esc(name)}</span><span class="chev">▾</span>`;
+  chip.onclick = openProfileMenu;
+}
+function openProfileMenu() {
+  if (!state.user) { showView('account'); return; }
+  openSheet(`<h3>${esc(state.user.displayName || state.user.username)}</h3>
+    <button class="more-row" onclick="closeSheet();showView('account')"><span class="more-ico">👤</span><span class="more-txt"><span class="more-t">Account</span><span class="more-s">Profile, alerts + push settings</span></span><span class="more-arrow">›</span></button>
+    <button class="more-row" onclick="closeSheet();showView('bankroll')"><span class="more-ico">💰</span><span class="more-txt"><span class="more-t">Bankroll</span><span class="more-s">Your money tracker</span></span><span class="more-arrow">›</span></button>
+    <button class="more-row" onclick="closeSheet();doSignOut()"><span class="more-ico">↩️</span><span class="more-txt"><span class="more-t">Sign out</span><span class="more-s">@${esc(state.user.username)}</span></span><span class="more-arrow">›</span></button>
+    <button class="btn secondary" style="width:100%" onclick="closeSheet()">Cancel</button>`);
+}
+function openShareSheet() {
+  if (!state.user) { showView('account'); return; }
+  if (!state.tickets.length) { showToast('Add a ticket first — then you can share it to the Board.'); return; }
+  openSheet(`<h3>Share a ticket</h3><p class="small muted">Post one of your tickets to the Community and the Board's Friends' tickets feed.</p>
+    ${state.tickets.map((t) => `<button class="more-row" onclick="closeSheet();postToCommunity(${t.id})"><span class="more-ico">🎟️</span><span class="more-txt"><span class="more-t">${esc(t.title || `${t.legs.length}-Bet Parlay`)}</span><span class="more-s">${fmtOdds(t.combinedOdds)} · Wager ${fmtMoney(t.stake)}</span></span><span class="more-arrow">›</span></button>`).join('')}
+    <button class="btn secondary" style="width:100%" onclick="closeSheet()">Cancel</button>`);
+}
+async function renderHome() {
+  renderProfileChip();
+  const el = $('#view-home');
+  if (!$('#home-news')) {
+    el.innerHTML = `<a class="report-link" href="mailto:Bosscochon1804@gmail.com">Report an issue</a><div id="home-news"></div><div id="home-tabs"></div>`;
+  }
+  renderHomeTabs();
+  renderNews();
+  if (state.homeTab === 'tickets') renderTickets(); else renderCommunity();
+}
+function renderHomeTabs() {
+  const t = $('#home-tabs');
+  if (!t) return;
+  t.innerHTML = `<div class="home-tabs"><button class="${state.homeTab === 'tickets' ? 'on' : ''}" onclick="setHomeTab('tickets')">My Tickets <span class="count-chip">${state.tickets.length}</span></button><button class="${state.homeTab === 'community' ? 'on' : ''}" onclick="setHomeTab('community')">Community</button></div>`;
+}
+async function renderPeople() {
+  const el = $('#view-people');
+  if (!state.user) { el.innerHTML = '<h2>People</h2>' + signInPromptHTML('Sign in to follow people, approve followers, and see their tickets on the Board.'); return; }
+  el.innerHTML = '<h2>People</h2><div id="people-body"><div class="empty">Loading people…</div></div>';
+  try {
+    const d = await api('GET', '/api/people');
+    state.peopleCache = d;
+    const initial = (n) => esc((n || '?').trim().charAt(0).toUpperCase());
+    const row = (p, btns) => `<div class="card tight"><div class="row between"><span class="row" style="gap:10px"><span class="avatar-c gray">${initial(p.name)}</span><span><strong>${esc(p.name)}</strong><div class="tiny muted">@${esc(p.username)}</div></span></span><span class="row" style="gap:6px">${btns}</span></div></div>`;
+    const reqBtns = (p) => `<button class="btn small" onclick="peopleApprove(${p.userId})">Approve</button><button class="btn secondary small" onclick="peopleDecline(${p.userId})">Decline</button>`;
+    const findBtn = (p) => p.outState === 'approved' ? `<span class="pill won">Following</span><button class="btn secondary small" onclick="peopleUnfollow(${p.userId})">Unfollow</button>` : p.outState === 'pending' ? '<span class="pill">Requested</span>' : `<button class="btn small" onclick="peopleRequest(${p.userId})">Request</button>`;
+    const body = $('#people-body');
+    if (!body) return;
+    body.innerHTML = `
+      <h3>Follow requests</h3>
+      <div class="small muted" style="margin-bottom:10px">People who follow you can see the tickets you share in the Board room. Approval is always up to you — nothing is shared until you approve.</div>
+      ${d.requests.length ? d.requests.map((p) => row(p, reqBtns(p))).join('') : '<div class="card"><div class="empty">No pending follow requests.</div></div>'}
+      <h3>Find people</h3>
+      ${d.people.length ? d.people.map((p) => row(p, findBtn(p))).join('') : '<div class="card"><div class="empty">No other accounts yet — you are early. Invite your people and this list fills in.</div></div>'}
+      <h3>Approved followers</h3>
+      ${d.followers.length ? d.followers.map((p) => row(p, `<button class="btn secondary small" onclick="peopleRemoveFollower(${p.userId})">Remove</button>`)).join('') : '<div class="card"><div class="empty">Your private bets have no approved followers.</div></div>'}
+      <h3>Following</h3>
+      ${d.following.length ? d.following.map((p) => row(p, `<button class="btn secondary small" onclick="peopleUnfollow(${p.userId})">Unfollow</button>`)).join('') : '<div class="card"><div class="empty">You are not following anyone yet.</div></div>'}
+      <button class="btn danger" style="width:100%;margin-top:14px" onclick="peopleRemoveAll(this)">Remove all follower access</button>
+      ${rgFooterHTML()}`;
+  } catch (e) {
+    const b = $('#people-body'); if (b) b.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
+}
+async function peopleAct(path, userId) {
+  try { await api('POST', path, userId === undefined ? {} : { userId }); renderPeople(); }
+  catch (e) { showToast(e.message); }
+}
+function peopleRequest(id) { peopleAct('/api/people/request', id); }
+function peopleApprove(id) { peopleAct('/api/people/approve', id); }
+function peopleDecline(id) { peopleAct('/api/people/decline', id); }
+function peopleUnfollow(id) { peopleAct('/api/people/unfollow', id); }
+function peopleRemoveFollower(id) { peopleAct('/api/people/remove-follower', id); }
+async function peopleRemoveAll(btn) {
+  if (!armButton(btn, 'Tap again to REMOVE ALL')) return;
+  try { await api('POST', '/api/people/remove-all', {}); showToast('All follower access removed.'); renderPeople(); }
+  catch (e) { showToast(e.message); }
 }
 
 /* ================= boot + refresh ================= */
