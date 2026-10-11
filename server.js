@@ -360,6 +360,7 @@ function normalizeGame(ev, league) {
   const st = ev.status || comp.status || {};
   const sit = comp.situation || {};
   const team = (c) => ({
+    id: (c.team && c.team.id !== undefined && c.team.id !== null) ? String(c.team.id) : '',
     abbr: (c.team && (c.team.abbreviation || c.team.shortDisplayName)) || '',
     name: (c.team && (c.team.displayName || c.team.name)) || '',
     shortName: (c.team && (c.team.shortDisplayName || c.team.name)) || '',
@@ -774,6 +775,358 @@ function gradeProp(prop, value, gameFinal) {
   if (prop.dir === 'over') return value > prop.line ? 'won' : (gameFinal ? (value === prop.line ? 'push' : 'lost') : null);
   if (prop.dir === 'under') return value < prop.line ? 'won' : (gameFinal ? (value === prop.line ? 'push' : 'lost') : null);
   return null;
+}
+
+/* ---------------- props projections (ESPN game logs) ----------------
+   Real math only: a player's last-10 completed ESPN game logs, averaged and
+   scored against the posted line. A prop we cannot resolve is ABSENT from the
+   output — never estimated, never fabricated. Lines come from the morning
+   Board (Hard Rock-verified), the user's own open legs, and — only when
+   ODDS_API_KEY is set — The Odds API adapter further down. */
+const GAMELOG_BASE = 'https://site.web.api.espn.com/apis/common/v3/sports';
+const SEARCH_URL = 'https://site.api.espn.com/apis/search/v2?query=';
+const SEARCH_LEAGUE_LABEL = { NFL: 'NFL', NCAAF: 'NCAAF', NBA: 'NBA', WNBA: 'WNBA', NCAAB: 'NCAAB', NCAAW: 'NCAAW', MLB: 'MLB', NHL: 'NHL', MLS: 'MLS', EPL: 'Premier League' };
+/* PROP_STATS.stat -> how to read the value out of an ESPN gamelog row.
+   Stat names verified against live gamelogs on 2026-10-11 (see SOURCES.md).
+   weights = weighted sum (total bases = H + 2B + 2x3B + 3xHR, all four must
+   be present); sum = add whichever components exist (anytime TD). Combined
+   "made-attempted" names (e.g. threePointFieldGoalsMade-...) parse via
+   parseFloat, which reads the leading "made" number. */
+const PROP_LOG_NAMES = {
+  pass_yards: { n: 'passingYards' }, pass_td: { n: 'passingTouchdowns' }, pass_int: { n: 'interceptions' },
+  completions: { n: 'completions' }, rush_yards: { n: 'rushingYards' }, rush_td: { n: 'rushingTouchdowns' },
+  carries: { n: 'rushingAttempts' }, rec_yards: { n: 'receivingYards' }, receptions: { n: 'receptions' },
+  rec_td: { n: 'receivingTouchdowns' }, tackles: { n: 'totalTackles' }, sacks: { n: 'sacks' },
+  points: { n: 'points' }, rebounds: { n: 'totalRebounds', alt: 'rebounds' }, assists: { n: 'assists' },
+  threes: { n: 'threePointFieldGoalsMade-threePointFieldGoalsAttempted' },
+  steals: { n: 'steals' }, blocks: { n: 'blocks' },
+  sog: { n: 'shotsTotal', alt: 'shots' }, goals: { n: 'goals' }, saves: { n: 'saves' },
+  hits: { n: 'hits' }, hr: { n: 'homeRuns' }, rbi: { n: 'RBIs' }, runs: { n: 'runs' }, sb: { n: 'stolenBases' },
+  ks: { n: 'strikeouts' }, fg: { n: 'fieldGoalsMade-fieldGoalsAttempted' },
+  total_bases: { weights: { hits: 1, doubles: 1, triples: 2, homeRuns: 3 } },
+  anytime_td: { sum: ['passingTouchdowns', 'rushingTouchdowns', 'receivingTouchdowns'] },
+};
+function gamelogStatValue(names, stats, stat) {
+  const spec = PROP_LOG_NAMES[stat];
+  if (!spec) return null;
+  const num = (name) => {
+    const i = names.indexOf(name);
+    if (i < 0) return null;
+    const raw = stats[i];
+    if (raw === undefined || raw === null || raw === '') return null;
+    const v = parseFloat(raw);
+    return Number.isNaN(v) ? null : v;
+  };
+  if (spec.weights) {
+    let total = 0;
+    for (const [name, w] of Object.entries(spec.weights)) {
+      const v = num(name);
+      if (v === null) return null;
+      total += v * w;
+    }
+    return total;
+  }
+  if (spec.sum) {
+    let total = 0; let any = false;
+    for (const name of spec.sum) { const v = num(name); if (v !== null) { total += v; any = true; } }
+    return any ? total : null;
+  }
+  let v = num(spec.n);
+  if (v === null && spec.alt) v = num(spec.alt);
+  return v;
+}
+const playerIdCache = new Map(); // `${league}|${normalized name}` -> { id, at }
+async function resolvePlayerId(league, playerName) {
+  const key = `${league}|${tokens(playerName).join(' ')}`;
+  const hit = playerIdCache.get(key);
+  if (hit && Date.now() - hit.at < (hit.id ? 86400000 : 3600000)) return hit.id;
+  let id = null;
+  try {
+    const data = await fetchJSON(SEARCH_URL + encodeURIComponent(playerName), 3600000);
+    const grp = (data.results || []).find((x) => x.type === 'player');
+    const contents = grp ? grp.contents || [] : [];
+    const norm = tokens(playerName).join(' ');
+    const exact = contents.filter((c) => tokens(c.displayName).join(' ') === norm);
+    const label = SEARCH_LEAGUE_LABEL[league];
+    const inLeague = exact.filter((c) => !label || (c.description || '') === label);
+    const pick = inLeague.length === 1 ? inLeague[0] : (inLeague.length === 0 && exact.length === 1 ? exact[0] : null);
+    if (pick) { const m = String(pick.uid || '').match(/~a:(\d+)/); if (m) id = m[1]; }
+  } catch { id = null; }
+  playerIdCache.set(key, { id, at: Date.now() });
+  return id;
+}
+/* Last <=10 completed-game values for one stat, most recent first. Rows are
+   collected across season types (e.g. MLB postseason + regular season),
+   deduped by event, and sorted by the gamelog's own event dates. */
+async function playerGameSeries(league, athleteId, stat) {
+  const p = leaguePath(league);
+  if (!p) return null;
+  let gl;
+  try { gl = await fetchJSON(`${GAMELOG_BASE}/${p}/athletes/${athleteId}/gamelog`, 900000); }
+  catch { return null; }
+  const names = gl.names || [];
+  const meta = gl.events || {};
+  const seen = new Set();
+  const rows = [];
+  for (const st of gl.seasonTypes || []) {
+    for (const cat of st.categories || []) {
+      if (cat.type !== 'event') continue;
+      for (const ev of cat.events || []) {
+        if (seen.has(ev.eventId)) continue;
+        seen.add(ev.eventId);
+        const v = gamelogStatValue(names, ev.stats || [], stat);
+        if (v === null) continue;
+        rows.push({ date: (meta[ev.eventId] && meta[ev.eventId].gameDate) || '', value: v });
+      }
+    }
+  }
+  rows.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  return rows.slice(0, 10).map((r) => r.value);
+}
+function projectionFromSeries(values, dir, line) {
+  if (!values || !values.length || line === null || line === undefined || !dir) return null;
+  const round1 = (x) => Math.round(x * 10) / 10;
+  const avg = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+  const l5 = values.slice(0, 5);
+  const hits = values.filter((v) => (dir === 'under' ? v < line : v > line)).length;
+  return { proj: round1(avg(values)), avgL10: round1(avg(values)), avgL5: round1(avg(l5)), hitL10: { hits, games: values.length }, last5: l5 };
+}
+function isBoardPropPlayServer(pl) {
+  const m = (pl.market || '').toLowerCase();
+  if (m.includes('prop') || m.includes('player')) return true;
+  const t = (pl.play || '').toLowerCase();
+  return /\b(over|under)\s+\d/.test(t) && /(yard|reception|point|rebound|assist|strikeout|hits|goal|shot|touchdown|passing|rushing|receiving|threes|blocks|steals|saves)/.test(t);
+}
+async function collectProjectionTargets(userId) {
+  const targets = [];
+  try {
+    const plays = await db.prepare('SELECT * FROM board_plays WHERE board_date = ? ORDER BY id').all(etDateStr());
+    for (const pl of plays) {
+      if (!isBoardPropPlayServer(pl)) continue;
+      const prop = parseProp({ selection: pl.play, market: pl.market, line: '' });
+      if (!prop || prop.unresolved || !prop.stat || !prop.dir || prop.line === null || prop.line === undefined) continue;
+      targets.push({ kind: 'board', refId: pl.id, league: (pl.league || '').toUpperCase(), prop, book: pl.sportsbook || 'Hard Rock Bet', odds: pl.odds, play: pl.play });
+    }
+  } catch { /* the Board is optional input */ }
+  if (userId) {
+    const legs = await db.prepare("SELECT l.* FROM legs l JOIN tickets t ON t.id = l.ticket_id WHERE t.user_id = ? AND t.status = 'open' AND l.status = 'pending' ORDER BY l.id").all(userId);
+    for (const leg of legs) {
+      const prop = parseProp(leg);
+      if (!prop || prop.unresolved || !prop.stat || !prop.dir || prop.line === null || prop.line === undefined) continue;
+      targets.push({ kind: 'leg', refId: leg.id, league: (leg.league || '').toUpperCase(), prop, book: 'Hard Rock Bet' });
+    }
+  }
+  try { targets.push(...await oddsBookTargets()); } catch { /* Odds API degrades silently */ }
+  return targets;
+}
+const PROJ_TTL_MS = 15 * 60 * 1000;
+const PROJ_PLAYER_CAP = 30;
+let projCache = { at: 0, key: '', data: null };
+let projInFlight = null;
+async function getProjections(userId) {
+  const key = 'u' + (userId || 0);
+  if (projCache.data && projCache.key === key && Date.now() - projCache.at < PROJ_TTL_MS) return projCache.data;
+  if (projInFlight && projInFlight.key === key) return projInFlight.promise;
+  const promise = (async () => {
+    const targets = await collectProjectionTargets(userId);
+    const out = { board: [], mine: [], book: [], oddsApi: oddsApiEnabled(), asOf: nowISO() };
+    const covered = new Set(); // league|player|stat already carried by an earlier target
+    const players = new Set(); // unique resolved players, capped per refresh
+    const seriesCache = new Map();
+    for (const t of targets) {
+      const coverKey = `${t.league}|${tokens(t.prop.player).join(' ')}|${t.prop.stat}|${t.prop.dir}`;
+      if (t.kind === 'book' && covered.has(coverKey)) continue;
+      covered.add(coverKey);
+      const athleteId = await resolvePlayerId(t.league, t.prop.player);
+      if (!athleteId) continue;
+      if (!players.has(athleteId)) {
+        if (players.size >= PROJ_PLAYER_CAP) continue;
+        players.add(athleteId);
+      }
+      const sKey = `${t.league}|${athleteId}|${t.prop.stat}`;
+      if (!seriesCache.has(sKey)) seriesCache.set(sKey, await playerGameSeries(t.league, athleteId, t.prop.stat));
+      const proj = projectionFromSeries(seriesCache.get(sKey), t.prop.dir, t.prop.line);
+      if (!proj) continue;
+      const entry = {
+        refId: t.refId, playerId: athleteId, player: t.prop.player, stat: t.prop.stat, statLabel: t.prop.statLabel,
+        dir: t.prop.dir, line: t.prop.line, book: t.book, league: t.league, ...proj, asOf: out.asOf,
+      };
+      if (t.kind === 'board') { entry.odds = t.odds; entry.play = t.play; out.board.push(entry); }
+      else if (t.kind === 'leg') out.mine.push(entry);
+      else { entry.odds = t.odds; entry.matchup = t.matchup; entry.commenceTime = t.commenceTime; out.book.push(entry); }
+    }
+    projCache = { at: Date.now(), key, data: out };
+    return out;
+  })();
+  projInFlight = { key, promise };
+  try { return await promise; } finally { if (projInFlight && projInFlight.promise === promise) projInFlight = null; }
+}
+
+/* ---------------- The Odds API adapter (optional) ----------------
+   Activates only when ODDS_API_KEY is set in the environment. Supplies real
+   book prop lines (Hard Rock / FanDuel / DraftKings where offered) for the
+   leagues ESPN says have games today. Spend is bounded: normalized lines are
+   cached 30 minutes, fetches are lazy (only when projections are requested),
+   and a failure backs off for 10 minutes instead of retrying. Every failure
+   degrades silently to the Board-only behavior. ODDS_API_BASE exists so the
+   adapter can be tested against a local mock; production uses the default. */
+const ODDS_API_BASE = process.env.ODDS_API_BASE || 'https://api.the-odds-api.com';
+const FOOTBALL_PROP_MARKETS = ['player_pass_yds', 'player_pass_tds', 'player_pass_interceptions', 'player_pass_completions', 'player_rush_yds', 'player_rush_attempts', 'player_rush_tds', 'player_reception_yds', 'player_receptions', 'player_reception_tds', 'player_anytime_td'];
+const BASKETBALL_PROP_MARKETS = ['player_points', 'player_rebounds', 'player_assists', 'player_threes', 'player_blocks', 'player_steals'];
+const BASEBALL_PROP_MARKETS = ['batter_hits', 'batter_home_runs', 'batter_rbis', 'batter_runs_scored', 'batter_total_bases', 'batter_stolen_bases', 'pitcher_strikeouts'];
+const HOCKEY_PROP_MARKETS = ['player_points', 'player_goals', 'player_assists', 'player_shots_on_goal', 'player_total_saves'];
+const ODDS_LEAGUES = {
+  NFL: { sport: 'americanfootball_nfl', markets: FOOTBALL_PROP_MARKETS },
+  NCAAF: { sport: 'americanfootball_ncaaf', markets: FOOTBALL_PROP_MARKETS },
+  NBA: { sport: 'basketball_nba', markets: BASKETBALL_PROP_MARKETS },
+  WNBA: { sport: 'basketball_wnba', markets: BASKETBALL_PROP_MARKETS },
+  NCAAB: { sport: 'basketball_ncaab', markets: BASKETBALL_PROP_MARKETS },
+  MLB: { sport: 'baseball_mlb', markets: BASEBALL_PROP_MARKETS },
+  NHL: { sport: 'icehockey_nhl', markets: HOCKEY_PROP_MARKETS },
+};
+const ODDS_MARKET_STAT = {
+  player_pass_yds: 'pass_yards', player_pass_tds: 'pass_td', player_pass_interceptions: 'pass_int',
+  player_pass_completions: 'completions', player_rush_yds: 'rush_yards', player_rush_attempts: 'carries',
+  player_rush_tds: 'rush_td', player_reception_yds: 'rec_yards', player_receptions: 'receptions',
+  player_reception_tds: 'rec_td', player_anytime_td: 'anytime_td',
+  player_points: 'points', player_rebounds: 'rebounds', player_assists: 'assists', player_threes: 'threes',
+  player_blocks: 'blocks', player_steals: 'steals',
+  batter_hits: 'hits', batter_home_runs: 'hr', batter_rbis: 'rbi', batter_runs_scored: 'runs',
+  batter_total_bases: 'total_bases', batter_stolen_bases: 'sb', pitcher_strikeouts: 'ks',
+  player_goals: 'goals', player_shots_on_goal: 'sog', player_total_saves: 'saves',
+};
+const ODDS_BOOK_PRIORITY = ['hardrock', 'fanduel', 'draftkings']; // Hard Rock is the book of record
+function oddsApiEnabled() { return !!(process.env.ODDS_API_KEY || ''); }
+let oddsCache = { at: 0, lines: [] };
+let oddsFailAt = 0;
+async function oddsBookTargets() {
+  const key = process.env.ODDS_API_KEY || '';
+  if (!key) return [];
+  const now = Date.now();
+  if (oddsCache.at && now - oddsCache.at < 30 * 60 * 1000) return oddsCache.lines;
+  if (oddsFailAt && now - oddsFailAt < 10 * 60 * 1000) return oddsCache.lines;
+  const today = etDateStr();
+  const active = [];
+  for (const league of Object.keys(ODDS_LEAGUES)) {
+    const games = await gamesForLeague(league);
+    if (games.some((g) => g.state === 'in' || String(g.start).slice(0, 10) === today)) active.push(league);
+  }
+  const raw = [];
+  let anyOk = false;
+  for (const league of active) {
+    try { raw.push(...await fetchOddsLeague(league, key)); anyOk = true; } catch { /* silent */ }
+  }
+  const rank = (b) => { const i = ODDS_BOOK_PRIORITY.indexOf(b); return i < 0 ? 99 : i; };
+  const best = new Map();
+  for (const ln of raw) {
+    const k = `${ln.league}|${tokens(ln.prop.player).join(' ')}|${ln.prop.stat}|${ln.prop.dir}`;
+    const cur = best.get(k);
+    if (!cur || rank(ln.bookKey) < rank(cur.bookKey)) best.set(k, ln);
+  }
+  const out = [...best.values()];
+  if (anyOk) { oddsCache = { at: now, lines: out }; oddsFailAt = 0; }
+  else oddsFailAt = now;
+  return out;
+}
+async function fetchOddsLeague(league, key) {
+  const cfg = ODDS_LEAGUES[league];
+  const markets = cfg.markets.join(',');
+  const base = `${ODDS_API_BASE}/v4/sports/${cfg.sport}/odds/?apiKey=${encodeURIComponent(key)}&markets=${markets}&oddsFormat=american`;
+  let r = await fetch(`${base}&regions=us&bookmakers=fanduel,draftkings,hardrock`, { headers: { 'User-Agent': 'SweatWithWilk/1.0' } });
+  if (!r.ok) {
+    /* one retry without the bookmaker filter (in case a book key is not
+       offered); lines are still matched to our books by key below. */
+    r = await fetch(`${base}&regions=us`, { headers: { 'User-Agent': 'SweatWithWilk/1.0' } });
+    if (!r.ok) throw new Error('odds ' + r.status);
+  }
+  const events = await r.json();
+  const out = [];
+  for (const ev of Array.isArray(events) ? events : []) {
+    const matchup = `${ev.away_team || ''} at ${ev.home_team || ''}`;
+    for (const bk of ev.bookmakers || []) {
+      if (!ODDS_BOOK_PRIORITY.includes(bk.key)) continue;
+      for (const mk of bk.markets || []) {
+        const stat = ODDS_MARKET_STAT[mk.key];
+        if (!stat) continue;
+        const def = PROP_STATS.find((x) => x.stat === stat);
+        if (!def) continue;
+        const byPlayer = new Map();
+        for (const oc of mk.outcomes || []) {
+          const player = String(oc.description || '').trim();
+          if (!player) continue;
+          if (!byPlayer.has(player)) byPlayer.set(player, {});
+          const sides = byPlayer.get(player);
+          const side = String(oc.name || '').toLowerCase();
+          if (side === 'over' || side === 'under') sides[side] = oc;
+          else if (stat === 'anytime_td' && side === 'yes') sides.yes = oc;
+        }
+        for (const [player, sides] of byPlayer) {
+          if (stat === 'anytime_td') {
+            if (sides.yes) out.push({ kind: 'book', refId: `odds-${league}-${bk.key}-${player}-${stat}`, league, prop: { player, stat, statLabel: def.label, dir: 'over', line: 0.5 }, book: bk.title || bk.key, bookKey: bk.key, odds: sides.yes.price ?? null, matchup, commenceTime: ev.commence_time || '' });
+            continue;
+          }
+          for (const dir of ['over', 'under']) {
+            const oc = sides[dir];
+            if (!oc || oc.point === undefined || oc.point === null) continue;
+            out.push({ kind: 'book', refId: `odds-${league}-${bk.key}-${player}-${stat}-${dir}`, league, prop: { player, stat, statLabel: def.label, dir, line: Number(oc.point) }, book: bk.title || bk.key, bookKey: bk.key, odds: oc.price ?? null, matchup, commenceTime: ev.commence_time || '' });
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/* ---------------- pregame form + head-to-head (ESPN schedules) ---------------- */
+async function teamScheduleEvents(league, teamId) {
+  const p = leaguePath(league);
+  if (!p || !teamId) return { team: null, events: [] };
+  const base = `${ESPN_BASE}/${p}/teams/${encodeURIComponent(teamId)}/schedule`;
+  let cur = null;
+  try { cur = await fetchJSON(base, 600000); } catch { cur = null; }
+  if (!cur) return { team: null, events: [] };
+  let events = Array.isArray(cur.events) ? [...cur.events] : [];
+  const year = cur.season && cur.season.year;
+  if (year) {
+    try {
+      const prev = await fetchJSON(`${base}?season=${Number(year) - 1}`, 600000);
+      if (prev && Array.isArray(prev.events)) events = events.concat(prev.events);
+    } catch { /* previous season is a bonus, not a requirement */ }
+  }
+  return { team: cur.team || null, events };
+}
+function completedTeamRows(events, teamId) {
+  const seen = new Set();
+  const rows = [];
+  for (const ev of events) {
+    if (!ev || ev.id === undefined || seen.has(String(ev.id))) continue;
+    seen.add(String(ev.id));
+    const comp = (ev.competitions || [])[0];
+    if (!comp) continue;
+    const st = comp.status && comp.status.type;
+    if (!st || st.state !== 'post') continue;
+    const cs = comp.competitors || [];
+    const mine = cs.find((c) => String((c.team || {}).id) === String(teamId));
+    const opp = cs.find((c) => String((c.team || {}).id) !== String(teamId));
+    if (!mine || !opp) continue;
+    const ts = mine.score && mine.score.value !== undefined ? Number(mine.score.value) : null;
+    const os = opp.score && opp.score.value !== undefined ? Number(opp.score.value) : null;
+    if (ts === null || os === null || Number.isNaN(ts) || Number.isNaN(os)) continue;
+    rows.push({
+      eventId: String(ev.id), date: ev.date || comp.date || '',
+      oppId: String((opp.team || {}).id || ''), oppAbbr: (opp.team || {}).abbreviation || '', oppName: (opp.team || {}).displayName || '',
+      home: mine.homeAway === 'home', teamScore: ts, oppScore: os,
+      result: ts > os ? 'W' : ts < os ? 'L' : 'D',
+    });
+  }
+  rows.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  return rows;
+}
+function recordString(rows) {
+  const w = rows.filter((r) => r.result === 'W').length;
+  const l = rows.filter((r) => r.result === 'L').length;
+  const d = rows.filter((r) => r.result === 'D').length;
+  return `${w} W · ${l} L${d ? ` · ${d} D` : ''}`;
 }
 
 /* ---------------- settle engine ---------------- */
@@ -1363,6 +1716,47 @@ const server = http.createServer(async (req, res) => {
         }
       }
       return sendJSON(res, 200, { props: out });
+    }
+    if (p === '/api/props/projections' && req.method === 'GET') {
+      const u = await currentUser(req); // optional: board + book projections are public, "mine" needs the session
+      try {
+        const data = await getProjections(u ? u.id : null);
+        return sendJSON(res, 200, data);
+      } catch {
+        return sendJSON(res, 200, { board: [], mine: [], book: [], oddsApi: oddsApiEnabled(), asOf: nowISO() });
+      }
+    }
+    if (p === '/api/games/form' && req.method === 'GET') {
+      const league = (url.searchParams.get('league') || '').toUpperCase();
+      const homeId = url.searchParams.get('homeId') || '';
+      const awayId = url.searchParams.get('awayId') || '';
+      const empty = { league, home: null, away: null, h2h: [], h2hRecord: '', asOf: nowISO() };
+      if (!leaguePath(league) || !homeId || !awayId) return sendJSON(res, 200, empty);
+      try {
+        const [hs, as] = await Promise.all([teamScheduleEvents(league, homeId), teamScheduleEvents(league, awayId)]);
+        const homeAbbr = (hs.team && hs.team.abbreviation) || '';
+        const awayAbbr = (as.team && as.team.abbreviation) || '';
+        const pack = (sched, rows, teamId) => ({
+          teamId: String(teamId), abbr: (sched.team && sched.team.abbreviation) || '', name: (sched.team && sched.team.displayName) || '',
+          last5: rows.slice(0, 5), record: recordString(rows.slice(0, 5)),
+        });
+        const hRows = completedTeamRows(hs.events, homeId);
+        const aRows = completedTeamRows(as.events, awayId);
+        const meetings = hRows.filter((r) => r.oppId === String(awayId)).slice(0, 5);
+        const h2h = meetings.map((r) => ({
+          date: r.date, eventId: r.eventId,
+          homeAbbr: r.home ? homeAbbr : r.oppAbbr, awayAbbr: r.home ? r.oppAbbr : homeAbbr,
+          homeScore: r.home ? r.teamScore : r.oppScore, awayScore: r.home ? r.oppScore : r.teamScore,
+          result: r.result, // from the dialog home team's perspective
+        }));
+        return sendJSON(res, 200, {
+          league, asOf: nowISO(),
+          home: pack(hs, hRows, homeId), away: pack(as, aRows, awayId),
+          h2h, h2hRecord: meetings.length ? recordString(meetings) : '',
+        });
+      } catch {
+        return sendJSON(res, 200, empty);
+      }
     }
 
     /* ---- board ---- */

@@ -54,6 +54,7 @@ const state = {
   homeTab: 'tickets', scoresSeg: 'live', ticketSeg: 'current', boardSeg: 'friends', peopleCache: null, lastDetail: null,
   detailCache: new Map(), blockTab: new Map(), fullPlays: new Set(), expandedBlocks: new Set(),
   alerts: null, communityCache: null,
+  formSeg: 'away', formData: null,
 };
 
 const MORE_VIEWS = ['props', 'news', 'bankroll', 'account'];
@@ -811,6 +812,24 @@ function isBoardPropPlay(pl) {
   const t = (pl.play || '').toLowerCase();
   return /\b(over|under)\s+\d/.test(t) && /(yard|reception|point|rebound|assist|strikeout|hits|goal|shot|touchdown|passing|rushing|receiving|threes|blocks|steals|saves)/.test(t);
 }
+/* Projection block (SNB shape): big Proj vs the posted line, hit rate over the
+   player's last games, and a last-5 bar series (mint = the side hit that game).
+   Only rendered when the server returned real ESPN game-log math for the prop. */
+function projBlockHTML(e) {
+  if (!e || !e.hitL10) return '';
+  const max = Math.max(...(e.last5 || [0]), e.line || 0, 1);
+  const bars = (e.last5 || []).map((v) => {
+    const hit = e.dir === 'under' ? v < e.line : v > e.line;
+    const h = Math.max(12, Math.round((v / max) * 100));
+    return `<span class="proj-dot ${hit ? 'hit' : 'miss'}" style="height:${h}%"></span>`;
+  }).join('');
+  return `<div class="proj-block">
+    <div class="row between"><span class="proj-num">Proj ${e.proj}</span><span class="small muted">Line ${e.line} · ${esc(e.book || 'Hard Rock Bet')}</span></div>
+    <div class="small" style="margin-top:3px">Hit in <strong>${e.hitL10.hits} of last ${e.hitL10.games}</strong> · Avg L5 ${e.avgL5} · Avg L10 ${e.avgL10}</div>
+    <div class="proj-dots">${bars}</div>
+    <div class="tiny muted">Last 5 (newest first): ${(e.last5 || []).join(' · ')} — projection = the player's own game-log average (ESPN), not a book number.</div>
+  </div>`;
+}
 async function renderProps() {
   const el = $('#view-props');
   el.innerHTML = `<h2>Player Props</h2><div class="small muted" style="margin:-6px 2px 2px">Top rated · All leagues</div><div id="props-body"><div class="empty">Loading props…</div></div>`;
@@ -828,24 +847,38 @@ async function renderProps() {
       boardDate = b.date;
       boardProps = (b.plays || []).filter(isBoardPropPlay);
     } catch { /* board section just stays empty */ }
+    let projBoard = new Map(), projMine = new Map(), bookProps = [];
+    try {
+      const pj = await api('GET', '/api/props/projections');
+      for (const e of pj.board || []) projBoard.set(e.refId, e);
+      for (const e of pj.mine || []) projMine.set(e.refId, e);
+      bookProps = pj.book || [];
+    } catch { /* projections are an enrichment — the page works without them */ }
     const myCard = (p) => `<div class="card tight">
       <div class="row between"><strong>${esc(p.player || p.selection)}</strong><span class="pill ${p.legStatus === 'won' ? 'won' : p.legStatus === 'lost' ? 'lost' : 'pending'}">${esc(p.legStatus)}</span></div>
       <div class="small muted">${esc(p.statLabel || '')}${p.line !== null && p.line !== undefined ? ` · ${p.dir === 'under' ? 'Under' : 'Over'} ${p.line}` : ''} · ${fmtOdds(p.odds)} · ${esc(p.league)}</div>
       <div class="small muted">${esc(p.gameLabel || '')}${p.gameState === 'in' ? ` · <span style="color:var(--red)">LIVE</span> ${esc(p.gameDetail || '')}` : p.gameState === 'post' ? ' · Final' : p.startsAt ? ' · ' + fmtDateTime(p.startsAt) : ''}</div>
       ${p.available ? `<div class="small" style="margin-top:5px"><strong>${esc(p.display || '')}</strong>${p.progress !== null && p.progress !== undefined ? `<div class="propbar"><div style="width:${p.progress}%"></div></div>` : ''}<span class="muted">${esc(p.remaining || '')}</span></div>` : `<div class="small muted" style="margin-top:5px">${esc(p.statusText || '')}</div>`}
       <div class="small muted" style="margin-top:4px">On: ${esc(p.ticketTitle || 'a ticket')}</div>
+      ${projBlockHTML(projMine.get(p.legId))}
     </div>`;
     const live = mine.filter((p) => p.gameState === 'in');
     const ranked = boardProps.map((pl, i) => `<div class="card tight">
       <div class="row between"><span class="row" style="gap:9px"><span class="rank-n">#${i + 1}</span><strong>${esc(pl.play)}</strong></span><span class="hr-odds">${pl.odds !== null && pl.odds !== undefined ? fmtOdds(pl.odds) : ''}</span></div>
       <div class="small muted" style="margin-top:3px">${esc(pl.league)}${pl.market ? ' · ' + esc(pl.market) : ''} · ${esc(pl.sportsbook)} · ${pl.tier !== 'watch' ? '<span style="color:var(--mint);font-weight:800">Actionable · +EV</span>' : 'Watch list'}</div>
       ${pl.edgeNote ? `<div class="small" style="margin-top:5px">${esc(pl.edgeNote)}</div>` : ''}
-      ${pl.verified ? `<div class="small" style="color:var(--mint);margin-top:4px">✓ Verified on Hard Rock Bet${pl.verifiedAt ? ' · ' + fmtDateTime(pl.verifiedAt) : ''}</div>` : ''}</div>`).join('');
+      ${pl.verified ? `<div class="small" style="color:var(--mint);margin-top:4px">✓ Verified on Hard Rock Bet${pl.verifiedAt ? ' · ' + fmtDateTime(pl.verifiedAt) : ''}</div>` : ''}${projBlockHTML(projBoard.get(pl.id))}</div>`).join('');
+    const bookCards = bookProps.map((e) => `<div class="card tight">
+      <div class="row between"><strong>${esc(e.player)} — ${e.dir === 'under' ? 'Under' : 'Over'} ${e.line} ${esc(e.statLabel || '')}</strong><span class="hr-odds">${e.odds !== null && e.odds !== undefined ? fmtOdds(e.odds) : ''}</span></div>
+      <div class="small muted" style="margin-top:3px">${esc(e.league)}${e.matchup ? ' · ' + esc(e.matchup) : ''}${e.commenceTime ? ' · ' + fmtDateTime(e.commenceTime) : ''}</div>
+      ${projBlockHTML(e)}
+    </div>`).join('');
     body().innerHTML = `
       ${state.user ? `<h3>Live player progress</h3>
       ${live.length ? live.map(myCard).join('') : `<div class="card"><div class="empty">No live player props right now.<br>When one of your prop legs is in a live game, its progress sweats here.</div></div>`}` : ''}
       <h3>Top rated props${boardDate ? ` · ${fmtDay(boardDate)}` : ''}</h3>
       ${boardProps.length ? ranked : `<div class="card"><div class="empty">No player props on today's Board — today was all sides and totals.<br>When the morning Board carries props, they rank here with the verified Hard Rock line.</div></div>`}
+      ${bookProps.length ? `<h3 style="margin-top:18px">More book props · live lines</h3>${bookCards}` : ''}
       <h3 style="margin-top:18px">Your props</h3>
       ${!state.user ? `<div class="card"><div class="empty">Sign in to sweat your prop legs here.<br><button class="btn" style="margin-top:8px" onclick="showView('account')">Sign in</button></div></div>`
         : mine.length ? mine.map(myCard).join('') : `<div class="card"><div class="empty">No player props on your open tickets right now.<br>Any ticket you add with a player prop leg — screenshot or typed — sweats here live with a progress bar.</div></div>`}
@@ -899,6 +932,54 @@ async function loadNews(league) {
   return (d.items || []).map((a) => ({ ...a, _leagueLabel: label(fetchLeague) }));
 }
 function setNewsLeague(l) { state.newsLeague = l; state.newsLimit = 8; renderNews(); }
+/* ---- pregame form + head-to-head (SPEC §3a shape) ---- */
+function fmtMD(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric' });
+}
+function formSectionShell(g) {
+  if (!g || !g.home || !g.away || !g.home.id || !g.away.id) return '';
+  const inner = `<div class="small" style="color:var(--mint);font-weight:800">PREGAME STATS</div><div id="gd-form"><div class="small muted" style="margin-top:4px">Loading form…</div></div>`;
+  if (g.state === 'pre') return `<div class="card tight" style="margin-top:12px">${inner}<div class="tiny muted" style="margin-top:6px">Completed games only · ESPN schedules</div></div>`;
+  return `<details class="card tight" style="margin-top:12px"><summary style="cursor:pointer;font-weight:700">Pregame form &amp; head-to-head</summary><div style="margin-top:8px">${inner}</div></details>`;
+}
+function setFormSeg(s) { state.formSeg = s; paintForm(); }
+function paintForm() {
+  const el = $('#gd-form');
+  const d = state.formData;
+  if (!el) return;
+  if (!d) { el.innerHTML = '<div class="small muted" style="margin-top:4px">Loading form…</div>'; return; }
+  const has = (d.home && d.home.last5 && d.home.last5.length) || (d.away && d.away.last5 && d.away.last5.length) || (d.h2h && d.h2h.length);
+  if (!has) { el.innerHTML = '<div class="small muted" style="margin-top:4px">No recent completed games on file for these teams yet.</div>'; return; }
+  const seg = state.formSeg;
+  const segBtn = (key, label) => `<button class="${seg === key ? 'on' : ''}" onclick="setFormSeg('${key}')">${esc(label)}</button>`;
+  const chip = (r) => `<span class="result-chip ${String(r).toLowerCase()}">${esc(r)}</span>`;
+  let inner = `<div class="seg" style="margin:8px 0">${segBtn('away', (d.away && d.away.abbr) || 'Away')}${segBtn('home', (d.home && d.home.abbr) || 'Home')}${segBtn('h2h', 'H2H')}</div>`;
+  const teamView = (t) => {
+    if (!t || !t.last5 || !t.last5.length) return '<div class="small muted">No completed games on file for this team.</div>';
+    return `<div class="row between"><strong>Last 5 games</strong><span class="small muted">${esc(t.abbr)} — ${esc(t.record || '')}</span></div>`
+      + t.last5.map((r) => `<div class="form-row"><span class="muted">${esc(fmtMD(r.date))}</span><span>${r.home ? 'vs' : '@'} ${esc(r.oppAbbr)}</span><span><strong>${r.teamScore}–${r.oppScore}</strong></span>${chip(r.result)}</div>`).join('');
+  };
+  if (seg === 'h2h') {
+    inner += `<div class="row between"><strong>Last ${d.h2h.length} against each other</strong><span class="small muted">Head-to-head${d.home && d.home.abbr ? ` — ${esc(d.home.abbr)} ${esc(d.h2hRecord || '')}` : ''}</span></div>`
+      + (d.h2h.length ? d.h2h.map((r) => `<div class="form-row"><span class="muted">${esc(fmtMD(r.date))}</span><span>${esc(r.awayAbbr)} @ ${esc(r.homeAbbr)}</span><span><strong>${r.awayScore}–${r.homeScore}</strong></span>${chip(r.result)}</div>`).join('') : '<div class="small muted">No completed meetings found in the current or previous season schedules.</div>');
+  } else {
+    inner += teamView(seg === 'home' ? d.home : d.away);
+  }
+  el.innerHTML = inner;
+}
+async function loadGameForm(league, g) {
+  state.formData = null;
+  try {
+    const d = await api('GET', `/api/games/form?league=${encodeURIComponent(league)}&homeId=${encodeURIComponent(g.home.id)}&awayId=${encodeURIComponent(g.away.id)}`);
+    const ld = state.lastDetail;
+    if (!ld || String(ld.eventId) !== String(g.id)) return; // dialog moved on to another game
+    state.formData = d;
+    paintForm();
+  } catch { const el = $('#gd-form'); if (el) el.innerHTML = '<div class="small muted" style="margin-top:4px">Form unavailable right now.</div>'; }
+}
 async function openGameDetail(league, eventId) {
   const blockId = `score-${eventId}`;
   state.lastDetail = { league, eventId };
@@ -919,8 +1000,11 @@ async function openGameDetail(league, eventId) {
       ${linescoreHTML(d)}
       ${situationHTML(g, d)}
       ${winProbHTML(d.winProbHome !== null && d.winProbHome !== undefined && g ? { winProbHome: d.winProbHome, home: g.home, away: g.away } : null)}
+      ${formSectionShell(g)}
       ${gameAlertsPanelHTML(eventId)}
       ${detailTabsHTML(blockId, league, eventId)}`;
+    state.formSeg = 'away';
+    if (g && g.home && g.away && g.home.id && g.away.id) loadGameForm(league, g);
   } catch (e) {
     const body = $('#gd-body'); if (body) body.innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
