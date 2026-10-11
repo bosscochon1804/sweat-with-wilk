@@ -186,3 +186,16 @@ img.ticket-img{max-width:100%;border-radius:10px;border:1px solid var(--line);ma
 .brand{min-width:0}
 .brand-name{white-space:nowrap}
 .profile-chip{flex:none}
+/* props projections + pregame form (v21) */
+.proj-block{margin-top:9px;border-top:1px solid var(--line);padding-top:8px}
+.proj-num{font-size:21px;font-weight:900;color:var(--mint)}
+.proj-dots{display:flex;gap:4px;align-items:flex-end;height:32px;margin-top:6px}
+.proj-dot{flex:1;border-radius:3px 3px 0 0;background:#33413a;min-height:5px}
+.proj-dot.hit{background:var(--mint)}
+.proj-dot.miss{background:#7a4040}
+.result-chip{display:inline-block;min-width:22px;text-align:center;padding:1px 6px;border-radius:6px;font-weight:800;font-size:11px}
+.result-chip.w{background:#14532d;color:#4ade80}
+.result-chip.l{background:#4c1d1d;color:#f87171}
+.result-chip.d{background:#3f420f;color:#d9d94a}
+.form-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--line)}
+.form-row:last-child{border-bottom:none}
