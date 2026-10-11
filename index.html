@@ -13,27 +13,32 @@
 <body>
 <header class="app-header">
   <div class="brand">
-    <div class="brand-name">SWEAT WITH WILK</div>
+    <div class="brand-name">SWEAT <span class="bolt">⚡</span> WITH WILK</div>
     <div class="brand-tag">Sweat your ticket, play by play.</div>
   </div>
-  <button id="alerts-bell" class="icon-btn" aria-label="Alerts" hidden>
-    🔔<span id="alerts-badge" class="badge" hidden>0</span>
-  </button>
+  <div class="header-right">
+    <button id="profile-chip" class="profile-chip" aria-label="Account"></button>
+    <button id="alerts-bell" class="icon-btn" aria-label="Alerts" hidden>
+      🔔<span id="alerts-badge" class="badge" hidden>0</span>
+    </button>
+  </div>
 </header>
 
 <main id="main">
-  <section id="view-tickets" class="view"></section>
+  <section id="view-home" class="view"></section>
+  <section id="view-tickets" class="view" hidden></section>
   <section id="view-scores" class="view" hidden></section>
   <section id="view-props" class="view" hidden></section>
   <section id="view-news" class="view" hidden></section>
   <section id="view-community" class="view" hidden></section>
   <section id="view-board" class="view" hidden></section>
+  <section id="view-people" class="view" hidden></section>
   <section id="view-bankroll" class="view" hidden></section>
   <section id="view-account" class="view" hidden></section>
   <section id="view-more" class="view" hidden>
     <h2>More</h2>
     <button class="more-row" onclick="showView('props')"><span class="more-ico">🎯</span><span class="more-txt"><span class="more-t">Props</span><span class="more-s">Your prop legs, live + today's prop plays</span></span><span class="more-arrow">›</span></button>
-    <button class="more-row" onclick="showView('news')"><span class="more-ico">📰</span><span class="more-txt"><span class="more-t">News</span><span class="more-s">Headlines by league</span></span><span class="more-arrow">›</span></button>
+    <button class="more-row" onclick="showView('home')"><span class="more-ico">📰</span><span class="more-txt"><span class="more-t">News</span><span class="more-s">Headlines by league — on Home</span></span><span class="more-arrow">›</span></button>
     <button class="more-row" onclick="showView('bankroll')"><span class="more-ico">💰</span><span class="more-txt"><span class="more-t">Bankroll</span><span class="more-s">Your money tracker</span></span><span class="more-arrow">›</span></button>
     <button class="more-row" onclick="showView('account')"><span class="more-ico">👤</span><span class="more-txt"><span class="more-t">Account</span><span class="more-s">Profile, alerts + push settings</span></span><span class="more-arrow">›</span></button>
   </section>
@@ -43,11 +48,11 @@
 <div id="toast-root"></div>
 
 <nav class="bottom-nav">
-  <button data-nav="tickets" class="nav-btn active"><span class="nav-ico">🎟️</span><span>Tickets</span></button>
+  <button data-nav="home" class="nav-btn active"><span class="nav-ico">🏠</span><span>Home</span></button>
   <button data-nav="scores" class="nav-btn"><span class="nav-ico">📊</span><span>Scores</span></button>
+  <button data-nav="props" class="nav-btn"><span class="nav-ico">🎯</span><span>Props</span></button>
   <button data-nav="board" class="nav-btn"><span class="nav-ico">📋</span><span>Board</span></button>
-  <button data-nav="community" class="nav-btn"><span class="nav-ico">💬</span><span>Community</span></button>
-  <button data-nav="more" class="nav-btn"><span class="nav-ico">☰</span><span>More</span></button>
+  <button data-nav="people" class="nav-btn"><span class="nav-ico">👥</span><span>People</span></button>
 </nav>
 
 <script src="/app.js"></script>

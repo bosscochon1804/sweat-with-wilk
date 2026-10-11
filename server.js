@@ -201,6 +201,13 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   auth TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS follows (
+  follower_id INTEGER NOT NULL,
+  followee_id INTEGER NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (follower_id, followee_id)
+);
 `;
 
 async function initDb() {
@@ -358,6 +365,7 @@ function normalizeGame(ev, league) {
     shortName: (c.team && (c.team.shortDisplayName || c.team.name)) || '',
     record: (c.records && c.records[0] && c.records[0].summary) || '',
     score: c.score === undefined || c.score === '' ? null : Number(c.score),
+    logo: (c.team && c.team.logo) || '',
   });
   return {
     id: String(ev.id),
@@ -369,8 +377,10 @@ function normalizeGame(ev, league) {
     start: ev.date || comp.date || '',
     home: team(home), away: team(away),
     broadcasts: (comp.broadcasts || []).flatMap((b) => b.names || []),
+    odds: (() => { const o = (comp.odds || [])[0]; if (!o) return null; const ml = o.moneyline || {}; const grab = (x) => (x && x.close && x.close.odds !== undefined ? String(x.close.odds) : null); return { provider: (o.provider && (o.provider.displayName || o.provider.name)) || '', homeML: grab(ml.home), awayML: grab(ml.away), drawML: grab(ml.draw), details: o.details || '' }; })(),
     venue: (comp.venue && comp.venue.fullName) || '',
     possessionAbbr: sit.possession ? ((competitors.find((c) => String(c.id) === String(sit.possession)) || {}).team || {}).abbreviation || '' : '',
+    yardLine: sit.yardLine ?? null,
     downDistanceText: sit.downDistanceText || '',
     situationText: sit.lastPlay ? (sit.lastPlay.text || '') : '',
     lastPlayText: sit.lastPlay ? (sit.lastPlay.text || '') : '',
@@ -483,6 +493,7 @@ function normalizeDetail(sum, league, eventId) {
     downDistanceText: sit.downDistanceText || '',
     driveText: sit.driveText || '',
     possessionAbbr: sit.possession ? ((competitors.find((c) => String(c.id) === String(sit.possession)) || {}).team || {}).abbreviation || '' : '',
+    yardLine: sit.yardLine ?? null,
     balls: sit.balls ?? null, strikes: sit.strikes ?? null, outs: sit.outs ?? null,
     onFirst: !!sit.onFirst, onSecond: !!sit.onSecond, onThird: !!sit.onThird,
     batterName: sit.batter ? (sit.batter.athlete && sit.batter.athlete.displayName) || '' : '',
@@ -1187,6 +1198,7 @@ const server = http.createServer(async (req, res) => {
         const items = (data.articles || []).map((a) => ({
           id: String(a.id), headline: a.headline || '', description: a.description || '',
           published: a.published || '', source: 'ESPN',
+          image: (a.images && a.images[0] && a.images[0].url) || '',
           url: (a.links && a.links.web && a.links.web.href) || '',
         }));
         return sendJSON(res, 200, { items, fetchedAt: nowISO(), error: '' });
@@ -1409,6 +1421,72 @@ const server = http.createServer(async (req, res) => {
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
       await settleAll();
       return sendJSON(res, 200, await bankrollFor(u.id));
+    }
+
+    /* ---- people (follow requests / approved followers) ---- */
+    if (p === '/api/people' && req.method === 'GET') {
+      const u = await currentUser(req);
+      if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
+      const person = (r) => ({ userId: r.id, name: displayNameOf(r), username: r.username });
+      const requests = (await db.prepare(`SELECT u.* FROM follows f JOIN users u ON u.id = f.follower_id
+        WHERE f.followee_id = ? AND f.state = 'pending' ORDER BY f.created_at`).all(u.id)).map(person);
+      const followers = (await db.prepare(`SELECT u.* FROM follows f JOIN users u ON u.id = f.follower_id
+        WHERE f.followee_id = ? AND f.state = 'approved' ORDER BY u.username`).all(u.id)).map(person);
+      const following = (await db.prepare(`SELECT u.* FROM follows f JOIN users u ON u.id = f.followee_id
+        WHERE f.follower_id = ? AND f.state = 'approved' ORDER BY u.username`).all(u.id)).map(person);
+      const others = await db.prepare('SELECT * FROM users WHERE id != ? ORDER BY username LIMIT 200').all(u.id);
+      const people = [];
+      for (const o of others) {
+        const out = await db.prepare('SELECT state FROM follows WHERE follower_id = ? AND followee_id = ?').get(u.id, o.id);
+        const inc = await db.prepare('SELECT state FROM follows WHERE follower_id = ? AND followee_id = ?').get(o.id, u.id);
+        people.push({ ...person(o), outState: out ? out.state : '', inState: inc ? inc.state : '' });
+      }
+      return sendJSON(res, 200, { requests, followers, following, people });
+    }
+    if (p === '/api/people/request' && req.method === 'POST') {
+      const u = await currentUser(req);
+      if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
+      const { userId } = await readBody(req);
+      const target = await db.prepare('SELECT * FROM users WHERE id = ?').get(Number(userId));
+      if (!target || target.id === u.id) return sendJSON(res, 400, { error: 'Pick someone else to follow.' });
+      const existing = await db.prepare('SELECT state FROM follows WHERE follower_id = ? AND followee_id = ?').get(u.id, target.id);
+      if (existing && existing.state === 'approved') return sendJSON(res, 400, { error: 'You already follow them.' });
+      if (!existing) await db.prepare('INSERT INTO follows (follower_id, followee_id, state, created_at) VALUES (?, ?, ?, ?)').run(u.id, target.id, 'pending', nowISO());
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (p === '/api/people/approve' && req.method === 'POST') {
+      const u = await currentUser(req);
+      if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
+      const { userId } = await readBody(req);
+      await db.prepare("UPDATE follows SET state = 'approved' WHERE follower_id = ? AND followee_id = ? AND state = 'pending'").run(Number(userId), u.id);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (p === '/api/people/decline' && req.method === 'POST') {
+      const u = await currentUser(req);
+      if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
+      const { userId } = await readBody(req);
+      await db.prepare("DELETE FROM follows WHERE follower_id = ? AND followee_id = ? AND state = 'pending'").run(Number(userId), u.id);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (p === '/api/people/unfollow' && req.method === 'POST') {
+      const u = await currentUser(req);
+      if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
+      const { userId } = await readBody(req);
+      await db.prepare('DELETE FROM follows WHERE follower_id = ? AND followee_id = ?').run(u.id, Number(userId));
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (p === '/api/people/remove-follower' && req.method === 'POST') {
+      const u = await currentUser(req);
+      if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
+      const { userId } = await readBody(req);
+      await db.prepare('DELETE FROM follows WHERE follower_id = ? AND followee_id = ?').run(Number(userId), u.id);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (p === '/api/people/remove-all' && req.method === 'POST') {
+      const u = await currentUser(req);
+      if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
+      await db.prepare('DELETE FROM follows WHERE followee_id = ?').run(u.id);
+      return sendJSON(res, 200, { ok: true });
     }
 
     /* ---- community ---- */
