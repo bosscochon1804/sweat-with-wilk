@@ -1488,6 +1488,17 @@ async function bankrollFor(userId) {
     byDay: [...byDayMap.values()].sort((a, b) => b.date.localeCompare(a.date)),
   };
 }
+/* Ensure a ticket is shared to Community (and therefore the Board's Friends'
+   tickets feed) exactly once. Used by the morning push when the job sets
+   shareToCommunity — same dedupe rule as the in-app share route. */
+async function ensureTicketShare(ownerId, ticketId, bodyText) {
+  const dup = await db.prepare('SELECT id FROM community_posts WHERE kind = ? AND ticket_id = ? AND user_id = ?').get('ticket', ticketId, ownerId);
+  if (dup) return false;
+  await db.prepare('INSERT INTO community_posts (user_id, kind, body, ticket_id, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(ownerId, 'ticket', String(bodyText || '').trim().slice(0, 2000), ticketId, nowISO());
+  return true;
+}
+
 async function communityJSON(viewer) {
   const posts = await db.prepare('SELECT p.*, u.username, u.display_name FROM community_posts p JOIN users u ON u.id = p.user_id ORDER BY p.id DESC LIMIT 100').all();
   const out = [];
@@ -1872,7 +1883,11 @@ const server = http.createServer(async (req, res) => {
       if (!owner) owner = await db.prepare('SELECT * FROM users ORDER BY id LIMIT 1').get();
       if (!owner) return sendJSON(res, 409, { error: 'No account exists yet to own the pushed ticket.' });
       const existing = await db.prepare('SELECT id FROM tickets WHERE user_id = ? AND external_ref = ?').get(owner.id, ref);
-      if (existing) return sendJSON(res, 200, { ok: true, deduped: true, ticketId: existing.id });
+      if (existing) {
+        let shared = false;
+        if (b.shareToCommunity) shared = await ensureTicketShare(owner.id, existing.id, b.shareBody);
+        return sendJSON(res, 200, { ok: true, deduped: true, ticketId: existing.id, shared });
+      }
       const legs = Array.isArray(b.legs) ? b.legs : [];
       if (!legs.length) return sendJSON(res, 400, { error: 'legs required.' });
       const notes = String(b.notes || 'Morning ticket — from today\'s Board').slice(0, 1000);
@@ -1883,7 +1898,9 @@ const server = http.createServer(async (req, res) => {
       for (const l of legs) {
         await ins.run(ticketId, String(l.league || '').toUpperCase().slice(0, 20), String(l.gameLabel || '').slice(0, 120), String(l.selection || '').slice(0, 200), String(l.market || '').slice(0, 80), String(l.line || '').slice(0, 40), Math.round(Number(l.odds) || -110), String(l.startsAt || '').slice(0, 40), 'pending');
       }
-      return sendJSON(res, 201, { ok: true, ticketId });
+      let shared = false;
+      if (b.shareToCommunity) shared = await ensureTicketShare(owner.id, ticketId, b.shareBody);
+      return sendJSON(res, 201, { ok: true, ticketId, shared });
     }
 
     /* ---- bankroll ---- */
