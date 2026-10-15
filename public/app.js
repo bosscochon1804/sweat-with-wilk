@@ -497,6 +497,8 @@ function openAddTicket() {
     <div><label>Notes (boost info, etc.)</label><textarea id="tf-notes" rows="2" placeholder="e.g. 25% Profit Boost, Boosted Payout $100.07"></textarea></div>
     <label>Boosted payout ($) — optional, overrides the math if the ticket wins</label>
     <input id="tf-boosted" type="number" step="0.01" min="0" placeholder="">
+    <label>Combined odds — optional (for an SGP / same-game parlay, where the book shows one price for the whole ticket)</label>
+    <input id="tf-combined" type="text" placeholder="e.g. +505">
     <h3 style="margin-top:16px">Legs — review before saving</h3>
     <div id="legs-wrap">${legRowHTML()}</div>
     <button class="btn secondary small" onclick="addLegRow()">+ Add leg</button>
@@ -515,7 +517,10 @@ function openAddTicket() {
       // are multi-MB PNGs that make the attach step slow and fragile on cellular.
       pendingImageDataUrl = await downscaleImage(reader.result).catch(() => reader.result);
       const img = $('#ticket-preview'); img.src = pendingImageDataUrl; img.style.display = 'block';
-      runOcr(pendingImageDataUrl);
+      // OCR reads the ORIGINAL full-resolution image. The downscaled copy is
+      // only for the attach/upload — reading it chopped digits off the odds
+      // (a 2436px-tall screenshot shrank to 1280px and -185 came back as -18).
+      runOcr(reader.result);
     };
     reader.readAsDataURL(f);
   });
@@ -558,11 +563,18 @@ const TEAM_BOOK = [
   ['Ducks','Anaheim Ducks','NHL'],['Bruins','Boston Bruins','NHL'],['Sabres','Buffalo Sabres','NHL'],['Flames','Calgary Flames','NHL'],['Hurricanes','Carolina Hurricanes','NHL'],['Blackhawks','Chicago Blackhawks','NHL'],['Avalanche','Colorado Avalanche','NHL'],['Blue Jackets','Columbus Blue Jackets','NHL'],['Stars','Dallas Stars','NHL'],['Red Wings','Detroit Red Wings','NHL'],['Oilers','Edmonton Oilers','NHL'],['Panthers','Florida Panthers','NHL'],['Kings','Los Angeles Kings','NHL'],['Wild','Minnesota Wild','NHL'],['Canadiens','Montreal Canadiens','NHL'],['Predators','Nashville Predators','NHL'],['Devils','New Jersey Devils','NHL'],['Islanders','New York Islanders','NHL'],['Rangers','New York Rangers','NHL'],['Senators','Ottawa Senators','NHL'],['Flyers','Philadelphia Flyers','NHL'],['Penguins','Pittsburgh Penguins','NHL'],['Sharks','San Jose Sharks','NHL'],['Kraken','Seattle Kraken','NHL'],['Blues','St. Louis Blues','NHL'],['Lightning','Tampa Bay Lightning','NHL'],['Maple Leafs','Toronto Maple Leafs','NHL'],['Mammoth','Utah Mammoth','NHL'],['Canucks','Vancouver Canucks','NHL'],['Golden Knights','Vegas Golden Knights','NHL'],['Capitals','Washington Capitals','NHL'],['Jets','Winnipeg Jets','NHL'],
   // NBA
   ['Hawks','Atlanta Hawks','NBA'],['Celtics','Boston Celtics','NBA'],['Nets','Brooklyn Nets','NBA'],['Hornets','Charlotte Hornets','NBA'],['Bulls','Chicago Bulls','NBA'],['Cavaliers','Cleveland Cavaliers','NBA'],['Mavericks','Dallas Mavericks','NBA'],['Nuggets','Denver Nuggets','NBA'],['Pistons','Detroit Pistons','NBA'],['Warriors','Golden State Warriors','NBA'],['Rockets','Houston Rockets','NBA'],['Pacers','Indiana Pacers','NBA'],['Clippers','Los Angeles Clippers','NBA'],['Lakers','Los Angeles Lakers','NBA'],['Grizzlies','Memphis Grizzlies','NBA'],['Heat','Miami Heat','NBA'],['Bucks','Milwaukee Bucks','NBA'],['Timberwolves','Minnesota Timberwolves','NBA'],['Pelicans','New Orleans Pelicans','NBA'],['Knicks','New York Knicks','NBA'],['Thunder','Oklahoma City Thunder','NBA'],['Magic','Orlando Magic','NBA'],['76ers','Philadelphia 76ers','NBA'],['Suns','Phoenix Suns','NBA'],['Trail Blazers','Portland Trail Blazers','NBA'],['Kings','Sacramento Kings','NBA'],['Spurs','San Antonio Spurs','NBA'],['Raptors','Toronto Raptors','NBA'],['Jazz','Utah Jazz','NBA'],['Wizards','Washington Wizards','NBA'],
+  ['Atlanta United','Atlanta United FC','MLS'],['Austin FC','Austin FC','MLS'],['Charlotte FC','Charlotte FC','MLS'],['Chicago Fire','Chicago Fire FC','MLS'],['FC Cincinnati','FC Cincinnati','MLS'],['Colorado Rapids','Colorado Rapids','MLS'],['Columbus Crew','Columbus Crew','MLS'],['D.C. United','D.C. United','MLS'],['FC Dallas','FC Dallas','MLS'],['Houston Dynamo','Houston Dynamo FC','MLS'],['Inter Miami','Inter Miami CF','MLS'],['LA Galaxy','LA Galaxy','MLS'],['Los Angeles FC','Los Angeles FC','MLS'],['Minnesota United','Minnesota United FC','MLS'],['CF Montreal','CF Montréal','MLS'],['Nashville SC','Nashville SC','MLS'],['New England Revolution','New England Revolution','MLS'],['New York City FC','New York City FC','MLS'],['Red Bulls','New York Red Bulls','MLS'],['Orlando City','Orlando City SC','MLS'],['Philadelphia Union','Philadelphia Union','MLS'],['Portland Timbers','Portland Timbers','MLS'],['Real Salt Lake','Real Salt Lake','MLS'],['Earthquakes','San Jose Earthquakes','MLS'],['Sounders','Seattle Sounders FC','MLS'],['Sporting Kansas City','Sporting Kansas City','MLS'],['St. Louis City','St. Louis CITY SC','MLS'],['Toronto FC','Toronto FC','MLS'],['Whitecaps','Vancouver Whitecaps FC','MLS'],['San Diego FC','San Diego FC','MLS'],
 ];
 const COLLEGE_TOKENS = ['UTSA','South Florida','UCF','FAU','FIU','Miami','Florida State','Florida','Georgia','Alabama','Texas','Ohio State','Michigan','LSU','Tennessee','Oklahoma','Notre Dame','Clemson','Penn State','Oregon','USC','UCLA','Auburn','Texas A&M','Ole Miss','Arkansas','Kentucky','South Carolina','Mississippi State','Vanderbilt','Missouri','Iowa','Wisconsin','Nebraska','Illinois','Indiana','Purdue','Michigan State','Rutgers','Maryland','Northwestern','Minnesota','Washington','Utah','Arizona','Arizona State','Colorado','BYU','Kansas','Kansas State','Iowa State','TCU','Baylor','Texas Tech','Houston','Cincinnati','West Virginia','Oklahoma State','Syracuse','Pittsburgh','Louisville','NC State','Duke','North Carolina','Virginia','Virginia Tech','Georgia Tech','Wake Forest','Boston College','Stanford','California','SMU','Memphis','Tulane','Boise State','Fresno State','San Diego State','UNLV','Air Force','Army','Navy','Liberty','App State','Coastal Carolina','Marshall','Troy','Louisiana','Georgia Southern','Old Dominion','Western Kentucky','Middle Tennessee','UTEP','New Mexico State','Sam Houston','Jacksonville State','Kennesaw State','Delaware','Missouri State'];
 function lookupTeam(name) {
   const n = (name || '').trim();
   if (!n) return null;
+  // A matchup string ("A vs B" / "A @ B") is never a single team — without this
+  // guard, "Nashville SC vs Sporting Kansas" college-matched on the word Kansas.
+  if (/\s+vs\s+/i.test(n) || n.includes('@')) return null;
+  // an exact full-name match always wins ("Winnipeg Jets" is the NHL team,
+  // not the NFL's Jets — both share the nickname and the old rule kept the first)
+  for (const [nick, full, league] of TEAM_BOOK) if (n === full) return { full, league };
   // exact full-name or nickname match, longest nickname wins
   let best = null;
   for (const [nick, full, league] of TEAM_BOOK) {
@@ -589,30 +601,98 @@ function parseStartTime(text) {
   const p2 = (x) => String(x).padStart(2, '0');
   return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(h)}:${tm[2]}`;
 }
+function titleCaseName(s) {
+  return String(s || '').toLowerCase().replace(/\b([a-z])/g, (m, c) => c.toUpperCase()).replace(/\bMc([a-z])/g, (m, c) => 'Mc' + c.toUpperCase());
+}
+function expandMatchup(label) {
+  // "Away @ Home", or Hard Rock My Bets' "Home vs Away" -> { gameLabel, league }
+  let away = '', home = '';
+  if (label.includes('@')) { const p = label.split('@'); away = (p[0] || '').trim(); home = (p[1] || '').trim(); }
+  else { const vm = label.match(/^(.+?)\s+vs\.?\s+(.+)$/i); if (!vm) return null; home = vm[1].trim(); away = vm[2].trim(); }
+  if (!away || !home) return null;
+  const ta = lookupTeam(away), th = lookupTeam(home);
+  if (!ta && !th && /[&•|]/.test(label)) return null; // OCR junk line, not a matchup
+  return { gameLabel: `${ta ? ta.full : away} @ ${th ? th.full : home}`, league: (ta && ta.league) || (th && th.league) || '' };
+}
+function marketFromLine(L, cur) {
+  if (/^to win$/i.test(L) || /moneyline/i.test(L) || /game result/i.test(L)) return 'Moneyline';
+  if (/anytime goalscorer|anytime goal scorer/i.test(L)) return 'Player Prop';
+  if (/spread/i.test(L)) return 'Spread';
+  if (/^(over|under|total)/i.test(L)) return 'Total';
+  if (/-\s*(strikeouts|points|rebounds|assists|steals|blocks|shots on goal|saves|passing yards|rushing yards|receiving yards)\s*$/i.test(L)) return 'Player Prop';
+  return cur;
+}
 function parseSlipText(raw) {
   const lines = raw.split('\n').map((s) => s.replace(/^[^A-Za-z0-9+$-]+/, '').trim()).filter(Boolean);
   const legs = [];
   const oddsAtEnd = /^(.+?)\s+([+-]\d{3,4})$/;
   const oddsOnly = /^([+-]\d{3,4})$/;
   const isHeader = (t) => /parlay|payout|wager|hide selections|track on lock|my bets/i.test(t);
+  const consumed = new Set();
+  let combinedOdds = 0;
+
+  // --- SGP blocks (Hard Rock My Bets): a header line "Team @ Team +505" whose
+  // legs carry NO individual odds — the sub-legs follow as bare lines.
   for (let i = 0; i < lines.length; i++) {
+    const hm = lines[i].match(oddsAtEnd);
+    if (!hm || !hm[1].includes('@')) continue;
+    const subs = [];
+    let startsAt = '', timeIdx = -1;
+    for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+      const L = lines[j];
+      if (oddsAtEnd.test(L) || oddsOnly.test(L)) break;
+      if (/:\d{2}\s*(am|pm)/i.test(L)) { startsAt = parseStartTime(L); timeIdx = j; continue; }
+      const ou = L.match(/^(over|under)\s+(\d+(?:\.\d+)?)$/i);
+      if (ou) { subs.push({ kind: 'ou', dir: ou[1], line: ou[2], idx: j }); continue; }
+      const pm = L.match(/^(.+?)\s+-\s+([A-Za-z][A-Za-z ]*)$/);
+      if (pm && subs.length && subs[subs.length - 1].kind === 'ou' && !subs[subs.length - 1].player) { subs[subs.length - 1].player = pm[1].trim(); subs[subs.length - 1].stat = pm[2].trim(); continue; }
+      if (/^to win$/i.test(L)) { subs.push({ kind: 'towin', idx: j }); continue; }
+      if (/^[A-Za-z][A-Za-z .']{1,40}$/.test(L) && !/go to event|super sub|enabled/i.test(L)) subs.push({ kind: 'team', text: L, idx: j });
+    }
+    const ouLegs = subs.filter((s) => s.kind === 'ou' && s.player);
+    const teamSubs = subs.filter((s) => s.kind === 'team');
+    if (ouLegs.length + teamSubs.length < 2) continue; // not really an SGP block
+    const cleanHeader = hm[1].replace(/^[^A-Za-z]+/, '');
+    const mm = expandMatchup(cleanHeader);
+    const gameLabel = mm ? mm.gameLabel : cleanHeader;
+    const league = mm ? mm.league : '';
+    combinedOdds = parseInt(hm[2], 10);
+    for (const s of subs) {
+      if (s.kind === 'ou' && s.player) {
+        legs.push({ league, market: 'Player Prop', gameLabel, selection: `${titleCaseName(s.player)} ${s.dir.toLowerCase() === 'over' ? 'Over' : 'Under'} ${s.line} ${titleCaseName(s.stat)}`, line: s.line, odds: '', startsAt });
+      } else if (s.kind === 'team') {
+        const t = lookupTeam(s.text);
+        legs.push({ league: (t && t.league) || league, market: 'Moneyline', gameLabel, selection: t ? t.full : titleCaseName(s.text), line: '', odds: '', startsAt });
+      }
+    }
+    consumed.add(i);
+    subs.forEach((s) => consumed.add(s.idx));
+    if (timeIdx >= 0) consumed.add(timeIdx);
+  }
+
+  // --- main pass: one selection line carrying its odds at the end
+  for (let i = 0; i < lines.length; i++) {
+    if (consumed.has(i)) continue;
     let selText = null, odds = null;
     let m = lines[i].match(oddsAtEnd);
     if (m && !isHeader(m[1])) { selText = m[1].trim(); odds = parseInt(m[2], 10); }
-    else if (oddsOnly.test(lines[i]) && i > 0 && !oddsAtEnd.test(lines[i - 1])) { selText = lines[i - 1]; odds = parseInt(lines[i], 10); }
+    else if (oddsOnly.test(lines[i]) && i > 0 && !consumed.has(i - 1) && !oddsAtEnd.test(lines[i - 1])) { selText = lines[i - 1]; odds = parseInt(lines[i], 10); }
     if (selText === null || odds === null || Number.isNaN(odds)) continue;
     if (/^\d+\s*-?\s*bet/i.test(selText)) continue;
-    // gather context from the next few lines
-    let market = '', gameLabel = '', startsAt = '';
+    if (selText.includes('@')) continue; // a matchup/header line, not a selection
+    // gather context from the next few lines (stop at the next leg)
+    let market = '', gameLabel = '', startsAt = '', propLabel = '';
+    const ctx = [];
     for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
       const L = lines[j];
       if (oddsAtEnd.test(L) || oddsOnly.test(L)) break;
-      if (/^to win$/i.test(L) || /moneyline/i.test(L)) market = 'Moneyline';
-      else if (/spread/i.test(L)) market = 'Spread';
-      else if (/^(over|under|total)/i.test(L)) market = 'Total';
-      if (L.includes('@')) gameLabel = L.replace(/\s+/g, ' ');
+      ctx.push(L);
+      market = marketFromLine(L, market);
+      if (/anytime goalscorer|anytime goal scorer/i.test(L)) propLabel = L;
+      if (L.includes('@') || /\s+vs\s+/i.test(L)) { const mm = expandMatchup(L); if (mm && !gameLabel) gameLabel = mm.gameLabel; }
       if (/:\d{2}\s*(am|pm)/i.test(L)) startsAt = parseStartTime(L);
     }
+    if (/anytime goalscorer|anytime goal scorer/i.test(selText)) market = 'Player Prop';
     if (!market && !gameLabel) continue; // not a leg block — likely the parlay header
     // split a trailing spread/total line off the selection ("UTSA -6.5", "Over 47.5")
     let line = '';
@@ -625,24 +705,25 @@ function parseSlipText(raw) {
     if (market === 'Moneyline' && selTeam) selection = selTeam.full + ' ML';
     if (market === 'Spread' && line) selection = selection + ' ' + line;
     if (market === 'Total' && line) selection = selText + ' ' + line;
-    // expand matchup team names
+    if (market === 'Player Prop' && propLabel) selection = titleCaseName(propLabel);
+    // expand matchup team names / resolve the league
     let league = selTeam ? selTeam.league : '';
-    if (gameLabel.includes('@')) {
+    if (!league && gameLabel.includes('@')) {
       const [a, b] = gameLabel.split('@').map((s) => s.trim());
       const ta = lookupTeam(a), tb = lookupTeam(b);
-      // OCR garbage lines (nav bars, icon rows) can contain '@' — if neither side
-      // resolves to any known team and the line has junk symbols, leave it blank.
-      if (!ta && !tb && /[&•|]/.test(gameLabel)) gameLabel = '';
-      else gameLabel = `${ta ? ta.full : a} @ ${tb ? tb.full : b}`;
-      if (!league) league = (ta && ta.league) || (tb && tb.league) || '';
+      league = (ta && ta.league) || (tb && tb.league) || '';
     }
+    if (!league && market === 'Player Prop' && /goalscorer|goal scorer/i.test(ctx.join(' '))) league = 'MLS';
     legs.push({ league: league || 'NFL', market, gameLabel, selection, line, odds, startsAt });
   }
-  // Salvage pass: a leg whose odds OCR garbled (e.g. "Golden Knights 0)") still
-  // shows up with a blank odds field for review instead of vanishing entirely.
+
+  // --- salvage pass: a leg whose odds OCR garbled still shows up with a blank
+  // odds box for review instead of vanishing. Context NEVER crosses the next
+  // odds-bearing line — crossing it stitched two different legs together.
   for (let i = 0; i < lines.length; i++) {
+    if (consumed.has(i)) continue;
     const L = lines[i];
-    if (L.includes('@') || oddsAtEnd.test(L) || oddsOnly.test(L) || isHeader(L)) continue;
+    if (L.includes('@') || /\s+vs\s+/i.test(L) || oddsAtEnd.test(L) || oddsOnly.test(L) || isHeader(L)) continue;
     const words = L.split(/\s+/);
     let team = null;
     for (let k = words.length; k >= 1; k--) { const t = lookupTeam(words.slice(0, k).join(' ')); if (t) { team = t; break; } }
@@ -651,14 +732,14 @@ function parseSlipText(raw) {
     let market = '', gameLabel = '', startsAt = '';
     for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
       const X = lines[j];
-      if (/^to win$/i.test(X) || /moneyline/i.test(X)) market = 'Moneyline';
-      else if (/spread/i.test(X)) market = 'Spread';
-      else if (/^(over|under|total)/i.test(X)) market = 'Total';
-      if (X.includes('@')) { const [a, b] = X.split('@').map((s) => s.trim()); const ta = lookupTeam(a), tb = lookupTeam(b); if (ta || tb) gameLabel = `${ta ? ta.full : a} @ ${tb ? tb.full : b}`; }
+      if (oddsAtEnd.test(X) || oddsOnly.test(X)) break;
+      market = marketFromLine(X, market);
+      if (X.includes('@') || /\s+vs\s+/i.test(X)) { const mm = expandMatchup(X); if (mm && !gameLabel) gameLabel = mm.gameLabel; }
       if (/:\d{2}\s*(am|pm)/i.test(X)) startsAt = parseStartTime(X);
     }
     if (market && gameLabel) legs.push({ league: team.league, market, gameLabel, selection: market === 'Moneyline' ? team.full + ' ML' : team.full, line: '', odds: '', startsAt });
   }
+
   // stake: prefer the amount near "Wager"; ignore $0.00 and nav-bar amounts
   let stake = '';
   const wm = raw.match(/Wager[\s\S]{0,60}?\$\s?(\d+(?:\.\d{2})?)/i);
@@ -666,26 +747,68 @@ function parseSlipText(raw) {
   if (!stake) for (const L of lines) { if (/payout|my bets|rewards|games/i.test(L)) continue; const sm = L.match(/\$\s?(\d+(?:\.\d{2})?)/); if (sm && parseFloat(sm[1]) > 0) { stake = sm[1]; break; } }
   const idm = raw.match(/ID:?\s*(\d{8,})/i);
   const cm = raw.match(/(\d+)\s*-?\s*Bet Parlay/i);
-  return { legs, stake, slipId: idm ? idm[1] : '', expectedLegs: cm ? parseInt(cm[1], 10) : 0 };
+  return { legs, stake, slipId: idm ? idm[1] : '', expectedLegs: cm ? parseInt(cm[1], 10) : 0, combinedOdds };
+}
+function makeInvertedDataUrl(dataUrl) {
+  // Second OCR opinion for dark screenshots: white-on-black text inverted to
+  // black-on-white, which Tesseract often reads more cleanly.
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const c = document.createElement('canvas');
+        c.width = img.width; c.height = img.height;
+        const g = c.getContext('2d');
+        g.drawImage(img, 0, 0);
+        const d = g.getImageData(0, 0, c.width, c.height);
+        const px = d.data;
+        for (let k = 0; k < px.length; k += 4) { px[k] = 255 - px[k]; px[k + 1] = 255 - px[k + 1]; px[k + 2] = 255 - px[k + 2]; }
+        g.putImageData(d, 0, 0);
+        resolve(c.toDataURL('image/png'));
+      } catch (e) { reject(e); }
+    };
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
 }
 async function runOcr(dataUrl) {
   const status = $('#ocr-status');
   if (!window.Tesseract) { status.textContent = 'OCR is unavailable right now — the screenshot will attach; type the legs below.'; return; }
   status.textContent = 'Reading your ticket…';
   try {
-    const { data } = await Tesseract.recognize(dataUrl, 'eng');
-    pendingOcrText = data.text || '';
-    const parsed = parseSlipText(pendingOcrText);
+    // Two passes — the screenshot as-is, then inverted — keeping whichever
+    // parse finds more legs (ties: more legs carrying real odds).
+    const passes = [dataUrl];
+    const inverted = await makeInvertedDataUrl(dataUrl).catch(() => null);
+    if (inverted) passes.push(inverted);
+    let best = null;
+    for (const p of passes) {
+      try {
+        const { data } = await Tesseract.recognize(p, 'eng');
+        const parsed = parseSlipText(data.text || '');
+        const score = parsed.legs.length * 10 + parsed.legs.filter((l) => l.odds !== '' && l.odds !== null && l.odds !== undefined).length;
+        if (!best || score > best.score) best = { score, parsed, text: data.text || '' };
+      } catch { /* fall through to the next pass */ }
+    }
+    if (!best) throw new Error('OCR failed on every pass');
+    pendingOcrText = best.text;
+    const parsed = best.parsed;
     if (parsed.stake && !$('#tf-stake').value) $('#tf-stake').value = parsed.stake;
     const notes = $('#tf-notes');
     if (parsed.legs.length) {
       $('#legs-wrap').innerHTML = '';
       parsed.legs.forEach((leg) => addLegRow(leg));
       if (parsed.slipId && !notes.value) notes.value = `Hard Rock Bet slip ${parsed.slipId}`;
+      let sgpNote = '';
+      if (parsed.combinedOdds) {
+        const combEl = $('#tf-combined');
+        if (combEl && !combEl.value) combEl.value = parsed.combinedOdds > 0 ? `+${parsed.combinedOdds}` : `${parsed.combinedOdds}`;
+        sgpNote = ` This looks like an SGP — combined odds ${parsed.combinedOdds > 0 ? '+' : ''}${parsed.combinedOdds} filled in below; its legs share that one price.`;
+      }
       const missing = parsed.expectedLegs && parsed.expectedLegs > parsed.legs.length ? parsed.expectedLegs - parsed.legs.length : 0;
-      status.textContent = missing
+      status.textContent = (missing
         ? `Read ${parsed.legs.length} of ${parsed.expectedLegs} legs — ${missing} didn't read cleanly. Check each leg below, fill in any blank odds, and fix anything wrong before saving.`
-        : `Read ${parsed.legs.length} leg${parsed.legs.length > 1 ? 's' : ''} from your screenshot — check each one below and fix anything wrong before saving.`;
+        : `Read ${parsed.legs.length} leg${parsed.legs.length > 1 ? 's' : ''} from your screenshot — check each one below and fix anything wrong before saving.`) + sgpNote;
     } else {
       if (!notes.value) notes.value = pendingOcrText.slice(0, 400);
       status.textContent = 'Read finished, but no legs could be picked out — the raw text was added to Notes. Type the legs below; the screenshot still attaches.';
@@ -703,12 +826,19 @@ async function saveTicket() {
     startsAt: $('.lf-starts', row).value || '',
   })).filter((l) => l.selection);
   if (!legs.length) { err.innerHTML = '<div class="err" style="margin-top:10px">Add at least one leg with a selection.</div>'; return; }
-  for (const l of legs) if (Number.isNaN(l.odds)) { err.innerHTML = '<div class="err" style="margin-top:10px">Every leg needs American odds (like -110 or +150).</div>'; return; }
+  // SGP exception: when the ticket carries one combined price, legs may leave
+  // their own odds blank (the book never showed them) — they store at the
+  // default, and the combined price is the one the ticket displays.
+  const combinedVal = parseInt(($('#tf-combined') ? $('#tf-combined').value : '').replace('+', ''), 10);
+  const hasCombined = !Number.isNaN(combinedVal) && combinedVal !== 0 && Math.abs(combinedVal) >= 100;
+  for (const l of legs) if (Number.isNaN(l.odds) && !hasCombined) { err.innerHTML = '<div class="err" style="margin-top:10px">Every leg needs American odds (like -110 or +150) — or set the ticket\'s combined odds for an SGP.</div>'; return; }
+  for (const l of legs) if (Number.isNaN(l.odds)) l.odds = null;
   try {
     const d = await api('POST', '/api/tickets', {
       title: $('#tf-title').value.trim(), sportsbook: $('#tf-book').value.trim() || 'Hard Rock Bet',
       stake: parseFloat($('#tf-stake').value) || 0, notes: $('#tf-notes').value.trim(),
       boostedPayout: parseFloat($('#tf-boosted').value) || null,
+      combinedOdds: hasCombined ? combinedVal : null,
       source: pendingImageDataUrl ? 'screenshot' : 'manual', legs,
     });
     let imageFailed = false;
