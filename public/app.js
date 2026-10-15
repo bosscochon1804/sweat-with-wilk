@@ -99,6 +99,7 @@ async function refreshAlertBadge() {
 function render() {
   refreshAlertBadge();
   renderProfileChip();
+  updateFab();
   ({ home: renderHome, tickets: renderTickets, scores: renderScores, props: renderProps, news: renderNews, community: renderCommunity, board: renderBoard, people: renderPeople, bankroll: renderBankroll, account: renderAccount, more: renderMore })[state.view]();
 }
 
@@ -771,9 +772,29 @@ function makeInvertedDataUrl(dataUrl) {
     img.src = dataUrl;
   });
 }
+let tesseractLoadPromise = null;
+function loadTesseract() {
+  // Lazy: the OCR engine (~a few MB with its worker) is fetched only when a
+  // screenshot is actually picked, never on app startup (2026-10-15 speed pass).
+  if (window.Tesseract) return Promise.resolve(true);
+  if (!tesseractLoadPromise) {
+    tesseractLoadPromise = new Promise((resolve) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+      s.onload = () => resolve(!!window.Tesseract);
+      s.onerror = () => { tesseractLoadPromise = null; resolve(false); };
+      document.head.appendChild(s);
+    });
+  }
+  return tesseractLoadPromise;
+}
 async function runOcr(dataUrl) {
   const status = $('#ocr-status');
-  if (!window.Tesseract) { status.textContent = 'OCR is unavailable right now — the screenshot will attach; type the legs below.'; return; }
+  if (!window.Tesseract) {
+    status.textContent = 'Loading the ticket reader…';
+    const ok = await loadTesseract();
+    if (!ok) { status.textContent = 'OCR is unavailable right now — the screenshot will attach; type the legs below.'; return; }
+  }
   status.textContent = 'Reading your ticket…';
   try {
     // Two passes — the screenshot as-is, then inverted — keeping whichever
@@ -1460,12 +1481,17 @@ function openShareSheet() {
     ${state.tickets.map((t) => `<button class="more-row" onclick="closeSheet();postToCommunity(${t.id})"><span class="more-ico">🎟️</span><span class="more-txt"><span class="more-t">${esc(t.title || `${t.legs.length}-Bet Parlay`)}</span><span class="more-s">${fmtOdds(t.combinedOdds)} · Wager ${fmtMoney(t.stake)}</span></span><span class="more-arrow">›</span></button>`).join('')}
     <button class="btn secondary" style="width:100%" onclick="closeSheet()">Cancel</button>`);
 }
+function updateFab() {
+  const f = $('#fab-add-ticket');
+  if (f) f.hidden = !(state.view === 'home' && !!state.user);
+}
 async function renderHome() {
   renderProfileChip();
   const el = $('#view-home');
   if (!$('#home-news')) {
-    el.innerHTML = `<a class="report-link" href="mailto:Bosscochon1804@gmail.com">Report an issue</a><div id="home-news"></div><div id="home-tabs"></div>`;
+    el.innerHTML = `<a class="report-link" href="mailto:Bosscochon1804@gmail.com">Report an issue</a><button class="add-ticket-big add-ticket-top" onclick="openAddTicket()"><span class="plus">+</span><span>Add Ticket</span></button><div id="home-news"></div><div id="home-tabs"></div>`;
   }
+  updateFab();
   renderHomeTabs();
   renderNews();
   if (state.homeTab === 'tickets') renderTickets(); else renderCommunity();

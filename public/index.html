@@ -8,7 +8,7 @@
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/styles.css">
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js" defer></script>
+<!-- Tesseract (ticket OCR) is lazy-loaded by app.js on the first screenshot pick — not at startup. -->
 </head>
 <body>
 <header class="app-header">
@@ -46,6 +46,8 @@
 
 <div id="sheet-root"></div>
 <div id="toast-root"></div>
+
+<button id="fab-add-ticket" class="fab-add" onclick="openAddTicket()" hidden>+ Add Ticket</button>
 
 <nav class="bottom-nav">
   <button data-nav="home" class="nav-btn active"><span class="nav-ico">🏠</span><span>Home</span></button>
