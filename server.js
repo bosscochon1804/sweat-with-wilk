@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS tickets (
   notes TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL DEFAULT 'manual',
   boosted_payout REAL,
+  combined_override INTEGER,
   status TEXT NOT NULL DEFAULT 'open',
   payout REAL,
   image_file TEXT,
@@ -214,6 +215,14 @@ async function initDb() {
   // WAL is a local-file journaling mode; remote Turso manages its own storage.
   if (DB_URL.startsWith('file:')) await client.execute('PRAGMA journal_mode = WAL');
   await client.executeMultiple(SCHEMA_SQL);
+  // Older databases predate the SGP combined-odds override — add the column
+  // if it is missing. Handlers reference it only when a combined price is
+  // actually supplied, and ticketJSON guards on the value.
+  try {
+    const cols = await client.execute('PRAGMA table_info(tickets)');
+    const names = (cols.rows || []).map((r) => r.name);
+    if (!names.includes('combined_override')) await client.execute('ALTER TABLE tickets ADD COLUMN combined_override INTEGER');
+  } catch { /* best-effort */ }
 }
 
 /* ---------------- small utils ---------------- */
@@ -1221,6 +1230,10 @@ function computeTicketOutcome(ticket, legs) {
   if (ticket.boosted_payout && ticket.boosted_payout > 0) payout = money(ticket.boosted_payout);
   return { status: 'won', payout };
 }
+function validCombinedOdds(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n !== 0 && Math.abs(n) >= 100 ? n : null;
+}
 function parseBoostedPayout(notes) {
   const m = String(notes || '').match(/boosted payout[^$]*\$\s*([\d,]+(?:\.\d{1,2})?)/i);
   return m ? parseFloat(m[1].replace(/,/g, '')) : null;
@@ -1427,12 +1440,17 @@ async function alertCycle() {
 async function ticketJSON(t) {
   const legs = await db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(t.id);
   const combined = legs.reduce((a, l) => a * decimalFromAmerican(l.odds), 1);
+  // SGP tickets carry one real combined price (the book never showed per-leg
+  // odds) — when it is set, it wins over the leg-multiplied figure.
+  const override = t.combined_override ? Number(t.combined_override) : 0;
+  const combinedDec = override ? decimalFromAmerican(override) : combined;
   return {
     id: t.id, title: t.title, sportsbook: t.sportsbook, stake: t.stake, notes: t.notes,
     source: t.source, boostedPayout: t.boosted_payout, status: t.status, payout: t.payout,
     hasImage: !!t.image_file, externalRef: t.external_ref, createdAt: t.created_at, settledAt: t.settled_at,
-    combinedOdds: combined <= 1 ? 0 : combined >= 2 ? Math.round((combined - 1) * 100) : -Math.round(100 / (combined - 1)),
-    potentialPayout: t.boosted_payout && t.boosted_payout > 0 ? t.boosted_payout : money(t.stake * combined),
+    combinedOverride: override || null,
+    combinedOdds: override || (combined <= 1 ? 0 : combined >= 2 ? Math.round((combined - 1) * 100) : -Math.round(100 / (combined - 1))),
+    potentialPayout: t.boosted_payout && t.boosted_payout > 0 ? t.boosted_payout : money(t.stake * combinedDec),
     legs: legs.map((l) => ({
       id: l.id, league: l.league, gameLabel: l.game_label, selection: l.selection, market: l.market,
       line: l.line, odds: l.odds, startsAt: l.starts_at, status: l.status, eventId: l.event_id, finalValue: l.final_value,
@@ -1667,10 +1685,13 @@ const server = http.createServer(async (req, res) => {
       if (legs.length > 25) return sendJSON(res, 400, { error: 'Too many legs.' });
       const notes = String(b.notes || '').slice(0, 1000);
       const boosted = b.boostedPayout ? Number(b.boostedPayout) : parseBoostedPayout(notes);
-      const info = await db.prepare('INSERT INTO tickets (user_id, title, sportsbook, stake, notes, source, boosted_payout, status, external_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(u.id, String(b.title || '').slice(0, 120), String(b.sportsbook || (await getSettings(u.id)).defaultBook || 'Hard Rock Bet').slice(0, 60),
-          Math.max(0, Number(b.stake) || 0), notes, ['manual', 'screenshot', 'morning'].includes(b.source) ? b.source : 'manual',
-          boosted || null, 'open', b.externalRef ? String(b.externalRef).slice(0, 120) : null, nowISO());
+      const tCols = ['user_id', 'title', 'sportsbook', 'stake', 'notes', 'source', 'boosted_payout', 'status', 'external_ref', 'created_at'];
+      const tVals = [u.id, String(b.title || '').slice(0, 120), String(b.sportsbook || (await getSettings(u.id)).defaultBook || 'Hard Rock Bet').slice(0, 60),
+        Math.max(0, Number(b.stake) || 0), notes, ['manual', 'screenshot', 'morning'].includes(b.source) ? b.source : 'manual',
+        boosted || null, 'open', b.externalRef ? String(b.externalRef).slice(0, 120) : null, nowISO()];
+      const coManual = validCombinedOdds(b.combinedOdds);
+      if (coManual !== null) { tCols.push('combined_override'); tVals.push(coManual); }
+      const info = await db.prepare(`INSERT INTO tickets (${tCols.join(', ')}) VALUES (${tCols.map(() => '?').join(', ')})`).run(...tVals);
       const ticketId = Number(info.lastInsertRowid);
       const ins = db.prepare('INSERT INTO legs (ticket_id, league, game_label, selection, market, line, odds, starts_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
       for (const l of legs) {
@@ -1891,8 +1912,11 @@ const server = http.createServer(async (req, res) => {
       const legs = Array.isArray(b.legs) ? b.legs : [];
       if (!legs.length) return sendJSON(res, 400, { error: 'legs required.' });
       const notes = String(b.notes || 'Morning ticket — from today\'s Board').slice(0, 1000);
-      const info = await db.prepare('INSERT INTO tickets (user_id, title, sportsbook, stake, notes, source, boosted_payout, status, external_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(owner.id, String(b.title || 'Morning ticket').slice(0, 120), String(b.sportsbook || 'Hard Rock Bet').slice(0, 60), Math.max(0, Number(b.stake) || 0), notes, 'morning', b.boostedPayout ? Number(b.boostedPayout) : parseBoostedPayout(notes), 'open', ref, nowISO());
+      const pCols = ['user_id', 'title', 'sportsbook', 'stake', 'notes', 'source', 'boosted_payout', 'status', 'external_ref', 'created_at'];
+      const pVals = [owner.id, String(b.title || 'Morning ticket').slice(0, 120), String(b.sportsbook || 'Hard Rock Bet').slice(0, 60), Math.max(0, Number(b.stake) || 0), notes, 'morning', b.boostedPayout ? Number(b.boostedPayout) : parseBoostedPayout(notes), 'open', ref, nowISO()];
+      const coPush = validCombinedOdds(b.combinedOdds);
+      if (coPush !== null) { pCols.push('combined_override'); pVals.push(coPush); }
+      const info = await db.prepare(`INSERT INTO tickets (${pCols.join(', ')}) VALUES (${pCols.map(() => '?').join(', ')})`).run(...pVals);
       const ticketId = Number(info.lastInsertRowid);
       const ins = db.prepare('INSERT INTO legs (ticket_id, league, game_label, selection, market, line, odds, starts_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
       for (const l of legs) {
