@@ -11,18 +11,22 @@
 <!-- Tesseract (ticket OCR) is lazy-loaded by app.js on the first screenshot pick — not at startup. -->
 </head>
 <body>
+<div class="sticky-top">
 <header class="app-header">
   <div class="brand">
     <div class="brand-name">SWEAT <span class="bolt">⚡</span> WITH WILK</div>
-    <div class="brand-tag">Sweat your ticket, play by play.</div>
   </div>
   <div class="header-right">
+    <button id="hdr-bankroll" class="hdr-bank" onclick="showView('bankroll')" aria-label="Bankroll" hidden></button>
+    <button id="hdr-add" class="hdr-add" onclick="openAddTicket()" aria-label="Add a ticket" hidden>+</button>
     <button id="profile-chip" class="profile-chip" aria-label="Account"></button>
     <button id="alerts-bell" class="icon-btn" aria-label="Alerts" hidden>
       🔔<span id="alerts-badge" class="badge" hidden>0</span>
     </button>
   </div>
 </header>
+<div id="tonight-bar" class="tonight-bar" onclick="goTonight()" hidden></div>
+</div>
 
 <main id="main">
   <section id="view-home" class="view"></section>
