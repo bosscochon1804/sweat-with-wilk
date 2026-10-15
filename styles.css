@@ -8,8 +8,9 @@ html,body{margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;padding-bottom:86px}
 a{color:var(--mint)}
 button{font-family:inherit;cursor:pointer}
-.app-header{position:sticky;top:0;z-index:30;display:flex;align-items:center;justify-content:space-between;background:rgba(8,13,12,.96);border-bottom:1px solid var(--line);padding:12px 16px}
-.brand-name{font-weight:900;letter-spacing:.06em;font-size:20px;color:var(--text)}
+.sticky-top{position:sticky;top:0;z-index:30}
+.app-header{display:flex;align-items:center;justify-content:space-between;background:rgba(8,13,12,.96);border-bottom:1px solid var(--line);padding:8px 14px}
+.brand-name{font-weight:900;letter-spacing:.06em;font-size:17px;color:var(--text)}
 .brand-name span{color:var(--mint)}
 .brand-tag{color:var(--muted);font-size:12px;margin-top:1px}
 .icon-btn{position:relative;background:var(--card);border:1px solid var(--line);color:var(--text);border-radius:50%;width:42px;height:42px;font-size:19px}
@@ -156,6 +157,30 @@ img.ticket-img{max-width:100%;border-radius:10px;border:1px solid var(--line);ma
 .add-ticket-top{width:100%;margin:4px 0 12px;flex:none}
 .fab-add{position:fixed;right:14px;bottom:calc(86px + env(safe-area-inset-bottom));z-index:45;background:var(--mint);color:#062015;border:none;border-radius:999px;padding:13px 18px;font-weight:900;font-size:15px;box-shadow:0 6px 18px rgba(0,0,0,.55);cursor:pointer}
 .fab-add:active{transform:scale(.97)}
+/* v26: slim sticky header bits */
+.hdr-bank{background:var(--card);border:1px solid var(--line);color:var(--mint);border-radius:999px;padding:7px 11px;font-weight:800;font-size:13px;white-space:nowrap;flex:none}
+.hdr-add{background:var(--mint);color:#062015;border:none;border-radius:50%;width:36px;height:36px;font-size:22px;font-weight:900;line-height:1;flex:none;padding:0}
+.hdr-add:active{transform:scale(.95)}
+/* v26: loading skeleton placeholders */
+.skel{border:1px solid var(--line);background:var(--card);border-radius:var(--radius);padding:14px;margin-bottom:12px}
+.skel .bar{height:13px;border-radius:7px;background:linear-gradient(100deg,#182420 40%,#2a3a31 50%,#182420 60%);background-size:200% 100%;animation:skelShimmer 1.15s linear infinite}
+.skel .bar + .bar{margin-top:10px}
+@keyframes skelShimmer{to{background-position:-200% 0}}
+/* v26: collapsible Sporting News (sits below the tickets on Home) */
+.news-toggle{display:flex;align-items:center;justify-content:space-between;width:100%;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:13px 14px;color:var(--text);font-size:16px;font-weight:800;margin-top:14px}
+.news-chev{color:var(--mint);font-size:15px}
+/* v27: tonight exposure bar (sticks under the header via .sticky-top) */
+.tonight-bar{background:#0a100d;border-bottom:1px solid var(--line);color:var(--text);font-size:12.5px;font-weight:700;text-align:center;padding:5px 10px;cursor:pointer}
+/* v27: Tonight strip on Home */
+.tonight-card{border-color:var(--mint-dark)}
+.tonight-game{margin-top:10px;border-top:1px solid var(--line);padding-top:8px}
+.tonight-leg{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;background:none;border:none;border-bottom:1px solid var(--line);color:var(--text);padding:9px 2px;font-size:14.5px;text-align:left;cursor:pointer}
+.tonight-leg:last-child{border-bottom:none}
+.tonight-sel{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* v27: ticket search */
+.ticket-search{display:flex;gap:8px;align-items:center;margin-top:10px}
+.ticket-search input{flex:1;min-width:0}
+.ts-clear{background:var(--card);border:1px solid var(--line);color:var(--muted);border-radius:50%;width:34px;height:34px;font-size:17px;flex:none;line-height:1;padding:0}
 .share-sq{width:52px;height:52px;flex:none;background:var(--card);border:1px solid var(--mint);color:var(--mint);border-radius:12px;font-size:20px;font-weight:900}
 .dashed-empty{border:1.5px dashed var(--line);border-radius:12px;color:var(--muted);text-align:center;padding:26px 12px;font-size:14px;margin-top:12px}
 .news-card{display:flex;gap:12px;align-items:flex-start}
@@ -185,7 +210,7 @@ img.ticket-img{max-width:100%;border-radius:10px;border:1px solid var(--line);ma
 .pill.outcome-win{border-color:var(--mint);color:#062015;background:var(--mint);font-weight:900}
 .pill.outcome-loss{border-color:var(--red);color:#fff;background:#a12b2b;font-weight:900}
 .odds-purple{color:#c792ff;font-weight:800}
-@media (max-width:430px){ .brand-name{font-size:15px} .profile-chip .chip-name{max-width:84px} .profile-chip{padding-right:9px} }
+@media (max-width:430px){ .brand-name{font-size:15px} .profile-chip .chip-name{max-width:84px} .profile-chip{padding-right:9px} .hdr-bank{padding:6px 8px;font-size:12px} .header-right{gap:7px} }
 .brand{min-width:0}
 .brand-name{white-space:nowrap}
 .profile-chip{flex:none}

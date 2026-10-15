@@ -55,10 +55,43 @@ const state = {
   detailCache: new Map(), blockTab: new Map(), fullPlays: new Set(), expandedBlocks: new Set(),
   alerts: null, communityCache: null,
   formSeg: 'away', formData: null,
+  newsOpen: false, bankroll: null, boardCache: null, ticketQuery: '',
+  _cached: { tickets: false, board: false, bankroll: false },
 };
 
 const MORE_VIEWS = ['props', 'news', 'bankroll', 'account'];
 function renderMore() { /* static menu lives in index.html (#view-more) */ }
+
+/* ============ INSTANT-OPEN CACHE (v26) ============
+   Last successful board / tickets / bankroll payloads, keyed per signed-in
+   user id, so the app paints instantly on open and then syncs once. Display
+   only — every action still hits the server. Cleared on sign-out, and never
+   read for a different account. NO timers: refresh happens on open, on
+   returning to the app, and after user actions only. */
+const CACHE_PREFIX = 'sww:v26:';
+const CACHE_UID_KEY = 'sww:v26:uid';
+function cacheGet(kind, uid) {
+  const id = uid || (state.user && state.user.id);
+  if (!id) return null;
+  try { const raw = localStorage.getItem(`${CACHE_PREFIX}u${id}:${kind}`); return raw ? JSON.parse(raw) : null; } catch { return null; }
+}
+function cacheSet(kind, data) {
+  if (!state.user) return;
+  try { localStorage.setItem(`${CACHE_PREFIX}u${state.user.id}:${kind}`, JSON.stringify(data)); } catch { /* full/blocked — best effort */ }
+}
+function clearUserCache() {
+  try {
+    const out = [];
+    for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.startsWith(CACHE_PREFIX) && k !== CACHE_UID_KEY) out.push(k); }
+    out.forEach((k) => localStorage.removeItem(k));
+  } catch { /* ignore */ }
+}
+/* Loading placeholders (v26) — swapped for real content the moment it lands. */
+function skeletonHTML(n) {
+  let s = '';
+  for (let i = 0; i < (n || 3); i++) s += '<div class="skel" aria-hidden="true"><div class="bar" style="width:52%"></div><div class="bar" style="width:88%"></div><div class="bar" style="width:70%"></div></div>';
+  return s;
+}
 function showView(name) {
   // Home is a composite: Sports News on top, then the My Tickets or Community panel.
   if (name === 'tickets') { state.homeTab = 'tickets'; name = 'home'; }
@@ -70,6 +103,7 @@ function showView(name) {
     $('#view-tickets').hidden = state.homeTab !== 'tickets';
     $('#view-community').hidden = state.homeTab !== 'community';
   }
+  const hn = $('#home-news'); if (hn) hn.hidden = name !== 'home';
   $$('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.nav === name));
   window.scrollTo(0, 0);
   render();
@@ -83,8 +117,27 @@ async function refreshMe() {
     const d = await api('GET', '/api/me');
     state.user = d.user; state.settings = d.settings || null;
   } catch { state.user = null; }
+  // v26: the instant-open cache belongs to exactly one account — if the
+  // signed-in user is not the cache owner (or nobody is signed in), the
+  // hydrated data is dropped before anything paints.
+  try {
+    const hint = localStorage.getItem(CACHE_UID_KEY);
+    if (state.user) {
+      if (hint && hint !== String(state.user.id)) {
+        state.tickets = []; state.bankroll = null; state.boardCache = null;
+        state._cached = { tickets: false, board: false, bankroll: false };
+        clearUserCache();
+      }
+      localStorage.setItem(CACHE_UID_KEY, String(state.user.id));
+    } else {
+      localStorage.removeItem(CACHE_UID_KEY);
+      clearUserCache();
+      state.bankroll = null;
+    }
+  } catch { /* ignore */ }
   $('#alerts-bell').hidden = !state.user;
   renderProfileChip();
+  renderHeaderBits();
   refreshAlertBadge();
 }
 async function refreshAlertBadge() {
@@ -99,6 +152,7 @@ async function refreshAlertBadge() {
 function render() {
   refreshAlertBadge();
   renderProfileChip();
+  renderHeaderBits();
   updateFab();
   ({ home: renderHome, tickets: renderTickets, scores: renderScores, props: renderProps, news: renderNews, community: renderCommunity, board: renderBoard, people: renderPeople, bankroll: renderBankroll, account: renderAccount, more: renderMore })[state.view]();
 }
@@ -110,6 +164,9 @@ function signInPromptHTML(text) {
 async function loadTickets() {
   const d = await api('GET', '/api/tickets');
   state.tickets = d.tickets || [];
+  state._cached.tickets = true;
+  cacheSet('tickets', { tickets: state.tickets });
+  updateTonightBar();
 }
 function legStatusPill(l) {
   const s = l.status;
@@ -369,7 +426,7 @@ function ticketCardHTML(t) {
       ${detailTabsHTML(blockId, g.league, g.eventId)}` : ''}
     </div>`;
   }).join('');
-  return `<div class="card">
+  return `<div class="card" id="ticket-card-${t.id}">
     <div class="row between">
       <span class="row" style="gap:8px"><span class="hr-badge">${t.legs.length > 1 ? 'PARLAY' : 'SINGLE'}</span><strong>${esc(title)}</strong></span>
       <strong class="hr-combined">${fmtOdds(t.combinedOdds)}</strong>
@@ -388,6 +445,7 @@ function ticketCardHTML(t) {
     <div class="row wrap" style="margin-top:10px">
       <button class="btn secondary small" onclick="toggleTicketAlerts(${t.id}, ${ticketOff ? 'true' : 'false'})">🔔 Ticket alerts ${ticketOff ? 'off' : 'on'}</button>
       <button class="btn secondary small" onclick="postToCommunity(${t.id})">Post to Community</button>
+      <button class="btn secondary small" onclick="shareTicketCard(${t.id}, this)">Share</button>
       <button class="btn danger small" onclick="deleteTicket(${t.id}, this)">Delete</button>
     </div>
     ${t.notes ? `<div class="small muted" style="margin-top:10px">${esc(t.notes)}</div>` : ''}${t.hasImage ? `<img class="ticket-img" src="/api/tickets/${t.id}/image" alt="Ticket screenshot">` : ''}
@@ -398,13 +456,27 @@ function ticketIsSettledBucket(t) {
   if (t.status === 'open' || !t.settledAt) return false;
   return Date.now() - new Date(t.settledAt).getTime() >= 12 * 3600 * 1000;
 }
+function ticketMatchesQuery(t, q) {
+  // v27 search: display-only filter over what's loaded — never mutates data.
+  const words = String(q || '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return true;
+  const parts = [t.title || '', t.sportsbook || '', t.notes || '', (t.createdAt || '').slice(0, 10)];
+  for (const l of t.legs) {
+    parts.push(l.selection || '', l.gameLabel || '', l.league || '', l.market || '', l.line || '', (l.startsAt || '').slice(0, 10));
+    if (l.startsAt) { const fd = fmtDay(String(l.startsAt).slice(0, 10)); if (fd) parts.push(fd); }
+  }
+  const hay = parts.join(' ').toLowerCase();
+  return words.every((w) => hay.includes(w));
+}
 function filteredTickets() {
   if (!state.expandedTickets) state.expandedTickets = new Set();
-  return state.tickets.filter((t) => state.ticketSeg === 'settled' ? ticketIsSettledBucket(t) : !ticketIsSettledBucket(t));
+  const q = (state.ticketQuery || '').trim();
+  return state.tickets.filter((t) => (state.ticketSeg === 'settled' ? ticketIsSettledBucket(t) : !ticketIsSettledBucket(t)) && ticketMatchesQuery(t, q));
 }
 async function renderTickets() {
   const el = $('#view-tickets');
   if (!state.user) { el.innerHTML = signInPromptHTML('Sign in to add tickets and sweat them live, play by play.'); return; }
+  const searchHadFocus = document.activeElement && document.activeElement.id === 'ticket-search';
   el.innerHTML = `<div class="row" style="gap:10px;align-items:center">
       <button class="add-ticket-big" onclick="openAddTicket()"><span class="plus">+</span><span>Add Ticket</span></button>
       <button class="share-sq" onclick="openShareSheet()" aria-label="Share a ticket">⬆</button></div>
@@ -412,18 +484,23 @@ async function renderTickets() {
       <button class="${state.ticketSeg === 'current' ? 'on' : ''}" onclick="setTicketSeg('current')">Current</button>
       <button class="${state.ticketSeg === 'settled' ? 'on' : ''}" onclick="setTicketSeg('settled')">Settled</button>
     </div><button class="icon-btn" style="width:38px;height:38px;font-size:16px;flex:none" onclick="renderTickets()" aria-label="Refresh tickets">⟳</button></div>
+    <div class="ticket-search"><input id="ticket-search" type="search" placeholder="Search tickets — team, player, matchup, date…" value="${esc(state.ticketQuery || '')}" oninput="setTicketQuery(this.value)"><button id="ticket-search-clear" class="ts-clear" onclick="clearTicketQuery()" aria-label="Clear search" ${state.ticketQuery ? '' : 'hidden'}>×</button></div>
+    <div id="ticket-count" class="small muted" style="margin-top:6px"></div>
     <div class="small muted">Settled tickets move to Settled 12 hours after their verified result.</div>
-    <div id="tickets-list"><div class="empty">Loading…</div></div>`;
+    <div id="tickets-list">${skeletonHTML(3)}</div>`;
+  if (state._cached.tickets || state.tickets.length) renderTicketsLight();
+  if (searchHadFocus) { const si = $('#ticket-search'); if (si) { si.focus(); try { si.setSelectionRange(si.value.length, si.value.length); } catch { /* ignore */ } } }
   try {
     await loadTickets();
     renderHomeTabs();
     renderTicketsLight();
+    renderTonight();
     state.propCache = state.propCache || {};
     for (const t of state.tickets.filter((x) => x.status === 'open')) {
       api('GET', `/api/props?ticketId=${t.id}`).then((d) => { state.propCache[t.id] = d.props || []; if (state.view === 'home') renderTicketsLight(); }).catch(() => {});
     }
   } catch (e) {
-    const l = $('#tickets-list'); if (l) l.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    const l = $('#tickets-list'); if (l && !state._cached.tickets && !state.tickets.length) l.innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
 }
 function renderTicketsLight() {
@@ -432,7 +509,10 @@ function renderTicketsLight() {
   // Keep the segmented control's active state in sync after light re-renders.
   $$('#view-tickets .seg button').forEach((b) => b.classList.toggle('on', b.textContent.trim().toLowerCase() === state.ticketSeg));
   const vis = filteredTickets();
-  list.innerHTML = vis.length ? vis.map(ticketCardHTML).join('') : `<div class="dashed-empty">${state.ticketSeg === 'settled' ? 'Nothing settled yet — settled tickets land here 12 hours after their verified result.' : 'No current tickets.<br>Tap + Add Ticket to sweat your first one.'}</div>`;
+  const q = (state.ticketQuery || '').trim();
+  list.innerHTML = vis.length ? vis.map(ticketCardHTML).join('') : `<div class="dashed-empty">${q ? `No tickets match &ldquo;${esc(q)}&rdquo;.` : (state.ticketSeg === 'settled' ? 'Nothing settled yet — settled tickets land here 12 hours after their verified result.' : 'No current tickets.<br>Tap + Add Ticket to sweat your first one.')}</div>`;
+  const cnt = $('#ticket-count'); if (cnt) cnt.textContent = q ? `${vis.length} of ${state.tickets.length} tickets` : '';
+  const clr = $('#ticket-search-clear'); if (clr) clr.hidden = !q;
   if (state.expandedTickets) for (const t of vis) if (state.expandedTickets.has(t.id)) for (const g of groupLegsByGame(t)) if (g.eventId) ensureDetail(g.league, g.eventId);
 }
 function setTicketSeg(seg) { state.ticketSeg = seg; renderTicketsLight(); }
@@ -885,7 +965,7 @@ async function renderScores() {
   el.innerHTML = `<div class="row between"><h2 style="margin:0">Live Scores</h2><span class="row"><span id="scores-live-count" class="live-count"></span><button class="icon-btn" style="width:38px;height:38px;font-size:16px" onclick="renderScores()" aria-label="Refresh scores">⟳</button></span></div>
     <div class="chips" style="margin-top:12px">${chips}</div>
     <div class="seg" style="margin-bottom:12px">${segBtn('live', 'Live now')}${segBtn('upcoming', 'Upcoming')}${segBtn('today', 'Today')}</div>
-    <div id="your-games"></div><div id="scores-list"><div class="empty">Loading scores…</div></div>`;
+    <div id="your-games"></div><div id="scores-list">${skeletonHTML(3)}</div>`;
   // Your games first
   if (state.user) {
     try {
@@ -983,7 +1063,7 @@ function projBlockHTML(e) {
 }
 async function renderProps() {
   const el = $('#view-props');
-  el.innerHTML = `<h2>Player Props</h2><div class="small muted" style="margin:-6px 2px 2px">Top rated · All leagues</div><div id="props-body"><div class="empty">Loading props…</div></div>`;
+  el.innerHTML = `<h2>Player Props</h2><div class="small muted" style="margin:-6px 2px 2px">Top rated · All leagues</div><div id="props-body">${skeletonHTML(3)}</div>`;
   const body = () => $('#props-body');
   try {
     let mine = [];
@@ -1041,13 +1121,19 @@ async function renderProps() {
   }
 }
 
+function toggleNews() { state.newsOpen = !state.newsOpen; renderNews(); }
 async function renderNews() {
   const el = $('#home-news');
   if (!el) return;
+  if (!state.newsOpen) {
+    // v26: news starts collapsed under the tickets — fetch only on first open.
+    el.innerHTML = `<button class="news-toggle" onclick="toggleNews()" aria-expanded="false"><span>📰 Sporting News</span><span class="news-chev">▸</span></button>`;
+    return;
+  }
   const label = (l) => l === 'ALL' ? 'All leagues' : l === 'SOCCER' ? 'Soccer' : l;
   const chips = NEWS_LEAGUES.map((l) => `<button class="chip ${state.newsLeague === l ? 'on' : ''}" onclick="setNewsLeague('${l}')">${label(l)}</button>`).join('');
-  el.innerHTML = `<div class="row between"><h2 style="margin:0">📰 Sports News</h2><button class="icon-btn" style="width:38px;height:38px;font-size:16px" onclick="renderNews()" aria-label="Refresh news">⟳</button></div>
-    <div class="chips" style="margin-top:12px">${chips}</div><div id="news-list"><div class="empty">Loading news…</div></div>`;
+  el.innerHTML = `<button class="news-toggle" onclick="toggleNews()" aria-expanded="true"><span>📰 Sporting News</span><span class="news-chev">▾</span></button>
+    <div class="chips" style="margin-top:12px">${chips}<button class="icon-btn" style="width:38px;height:38px;font-size:16px;margin-left:auto" onclick="renderNews()" aria-label="Refresh news">⟳</button></div><div id="news-list">${skeletonHTML(2)}</div>`;
   try {
     const items = await loadNews(state.newsLeague);
     const list = $('#news-list');
@@ -1184,15 +1270,12 @@ async function toggleSheetGameAlert(eventId) {
 /* ================= BOARD ================= */
 async function renderBoard() {
   const el = $('#view-board');
-  el.innerHTML = `<h2>Board</h2><div class="seg" style="margin-bottom:14px"><button class="${state.boardSeg === 'friends' ? 'on' : ''}" onclick="setBoardSeg('friends')">Friends' tickets</button><button class="${state.boardSeg === 'top30' ? 'on' : ''}" onclick="setBoardSeg('top30')">Top 30 Board</button></div><div id="board-body"><div class="empty">Loading…</div></div>`;
+  el.innerHTML = `<h2>Board</h2><div class="seg" style="margin-bottom:14px"><button class="${state.boardSeg === 'friends' ? 'on' : ''}" onclick="setBoardSeg('friends')">Friends' tickets</button><button class="${state.boardSeg === 'top30' ? 'on' : ''}" onclick="setBoardSeg('top30')">Top 30 Board</button></div><div id="board-body">${skeletonHTML(3)}</div>`;
   if (state.boardSeg === 'friends') return renderBoardFriends();
   return renderBoardTop30();
 }
 function setBoardSeg(s) { state.boardSeg = s; renderBoard(); }
-async function renderBoardTop30() {
-  try {
-    const d = await api('GET', `/api/board${state.boardDate ? `?date=${state.boardDate}` : ''}`);
-    state.boardDate = d.date;
+function boardTop30HTML(d) {
     const dateOpts = (d.dates || []).map((x) => `<option value="${x}" ${x === d.date ? 'selected' : ''}>${fmtDay(x)}</option>`).join('');
     const actionable = d.plays.filter((x) => x.tier !== 'watch');
     const watch = d.plays.filter((x) => x.tier === 'watch');
@@ -1200,15 +1283,27 @@ async function renderBoardTop30() {
       <div class="small muted">${esc(pl.league)}${pl.market ? ' · ' + esc(pl.market) : ''} · ${esc(pl.sportsbook)}</div>
       ${pl.edgeNote ? `<div class="small" style="margin-top:4px">${esc(pl.edgeNote)}</div>` : ''}
       ${pl.verified ? `<div class="small" style="color:var(--mint);margin-top:4px">✓ Verified on Hard Rock Bet${pl.verifiedAt ? ' · ' + fmtDateTime(pl.verifiedAt) : ''}</div>` : ''}</div>`;
-    $('#board-body').innerHTML = `
+    return `
       <div class="row between wrap"><div class="muted">${fmtDay(d.date)}</div>
       ${dateOpts ? `<select class="picker" onchange="state.boardDate=this.value;renderBoard()">${dateOpts}</select>` : ''}</div>
       <div style="height:10px"></div>
       ${d.plays.length === 0 ? `<div class="card"><div class="empty">Today's Board hasn't landed yet — it lands by 7:00 AM ET.<br>Past boards stay archived by date and still count in your Bankroll.</div></div>` : ''}
       ${actionable.length ? `<h3>Actionable — +EV</h3>${actionable.map(playCard).join('')}` : ''}
       ${watch.length ? `<h3>Watch</h3>${watch.map(playCard).join('')}` : ''}` + rgFooterHTML();
+}
+async function renderBoardTop30() {
+  const body = () => $('#board-body');
+  let painted = false;
+  // v26: paint the cached board instantly, then sync fresh once.
+  if (!state.boardDate && state.boardCache) { const b = body(); if (b) { b.innerHTML = boardTop30HTML(state.boardCache); painted = true; } }
+  try {
+    const wantDate = state.boardDate;
+    const d = await api('GET', `/api/board${wantDate ? `?date=${wantDate}` : ''}`);
+    state.boardDate = d.date;
+    if (!wantDate) { state.boardCache = d; state._cached.board = true; cacheSet('board', d); }
+    const b = body(); if (b) b.innerHTML = boardTop30HTML(d);
   } catch (e) {
-    $('#board-body').innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    const b = body(); if (b && !painted) b.innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
 }
 
@@ -1245,14 +1340,9 @@ function friendTicketCardHTML(post) {
 }
 
 /* ================= BANKROLL ================= */
-async function renderBankroll() {
-  const el = $('#view-bankroll');
-  if (!state.user) { el.innerHTML = '<h2>Bankroll</h2>' + signInPromptHTML('Sign in to see your record, streak, and profit by day.'); return; }
-  el.innerHTML = '<h2>Bankroll</h2><div id="bank-body"><div class="empty">Loading…</div></div>';
-  try {
-    const b = await api('GET', '/api/bankroll');
+function bankrollBodyHTML(b) {
     const streakTxt = b.streak && b.streak.type ? `${b.streak.type === 'won' ? 'W' : 'L'}${b.streak.count}` : '—';
-    $('#bank-body').innerHTML = `
+    return `
       <div class="stat-grid">
         <div class="stat-box"><div class="num">${fmtMoney(b.currentBankroll)}</div><div class="lbl">Bankroll (start ${fmtMoney(b.startingBankroll)})</div></div>
         <div class="stat-box"><div class="num" style="color:${b.netProfit >= 0 ? 'var(--mint)' : 'var(--red)'}">${fmtMoney(b.netProfit)}</div><div class="lbl">Net profit</div></div>
@@ -1263,15 +1353,27 @@ async function renderBankroll() {
       </div>
       <h3>Profit by day</h3>
       ${b.byDay.length ? b.byDay.map((d) => `<div class="kv"><span>${fmtDay(d.date)} · ${d.wins}W-${d.losses}L</span><span style="color:${d.profit >= 0 ? 'var(--mint)' : 'var(--red)'};font-weight:700">${fmtMoney(d.profit)}</span></div>`).join('') : '<div class="empty">No settled tickets yet — finals grade themselves.</div>'}`;
+}
+async function renderBankroll() {
+  const el = $('#view-bankroll');
+  if (!state.user) { el.innerHTML = '<h2>Bankroll</h2>' + signInPromptHTML('Sign in to see your record, streak, and profit by day.'); return; }
+  el.innerHTML = '<h2>Bankroll</h2><div id="bank-body">' + (state.bankroll ? '' : skeletonHTML(2)) + '</div>';
+  // v26: paint the cached bankroll instantly, then sync fresh once.
+  if (state.bankroll) { const bb = $('#bank-body'); if (bb) bb.innerHTML = bankrollBodyHTML(state.bankroll); }
+  try {
+    const b = await api('GET', '/api/bankroll');
+    state.bankroll = b; state._cached.bankroll = true; cacheSet('bankroll', b);
+    const bb = $('#bank-body'); if (bb) bb.innerHTML = bankrollBodyHTML(b);
+    renderHeaderBits();
   } catch (e) {
-    $('#bank-body').innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    const bb = $('#bank-body'); if (bb && !state.bankroll) bb.innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
 }
 
 /* ================= COMMUNITY ================= */
 async function renderCommunity() {
   const el = $('#view-community');
-  el.innerHTML = '<div id="comm-body"><div class="empty">Loading the room…</div></div>';
+  el.innerHTML = '<div id="comm-body">' + skeletonHTML(3) + '</div>';
   try {
     const d = await api('GET', '/api/community');
     state.communityCache = d;
@@ -1405,7 +1507,13 @@ async function doSignIn() {
 async function doSignOut() {
   await api('POST', '/api/auth/signout');
   state.user = null; state.tickets = []; state.alerts = null;
+  // v26: the instant-open cache never outlives the session.
+  state.bankroll = null; state.boardCache = null;
+  state._cached = { tickets: false, board: false, bankroll: false };
+  try { localStorage.removeItem(CACHE_UID_KEY); } catch { /* ignore */ }
+  clearUserCache();
   $('#alerts-bell').hidden = true;
+  renderHeaderBits();
   render();
 }
 async function doReset() {
@@ -1481,6 +1589,25 @@ function openShareSheet() {
     ${state.tickets.map((t) => `<button class="more-row" onclick="closeSheet();postToCommunity(${t.id})"><span class="more-ico">🎟️</span><span class="more-txt"><span class="more-t">${esc(t.title || `${t.legs.length}-Bet Parlay`)}</span><span class="more-s">${fmtOdds(t.combinedOdds)} · Wager ${fmtMoney(t.stake)}</span></span><span class="more-arrow">›</span></button>`).join('')}
     <button class="btn secondary" style="width:100%" onclick="closeSheet()">Cancel</button>`);
 }
+/* Slim sticky header (v26): bankroll figure + quick-add, kept in sync here. */
+function renderHeaderBits() {
+  const add = $('#hdr-add'); if (add) add.hidden = !state.user;
+  const bank = $('#hdr-bankroll');
+  if (!bank) return;
+  const show = !!state.user && !!state.bankroll;
+  bank.hidden = !show;
+  if (show) bank.textContent = `💰 ${fmtMoney(state.bankroll.currentBankroll)}`;
+  updateTonightBar();
+}
+async function refreshHeaderBankroll() {
+  if (!state.user) { renderHeaderBits(); return; }
+  try {
+    const b = await api('GET', '/api/bankroll');
+    state.bankroll = b; state._cached.bankroll = true;
+    cacheSet('bankroll', b);
+  } catch { /* keep whatever figure we already have */ }
+  renderHeaderBits();
+}
 function updateFab() {
   const f = $('#fab-add-ticket');
   if (f) f.hidden = !(state.view === 'home' && !!state.user);
@@ -1489,10 +1616,18 @@ async function renderHome() {
   renderProfileChip();
   const el = $('#view-home');
   if (!$('#home-news')) {
-    el.innerHTML = `<a class="report-link" href="mailto:Bosscochon1804@gmail.com">Report an issue</a><button class="add-ticket-big add-ticket-top" onclick="openAddTicket()"><span class="plus">+</span><span>Add Ticket</span></button><div id="home-news"></div><div id="home-tabs"></div>`;
+    el.innerHTML = `<a class="report-link" href="mailto:Bosscochon1804@gmail.com">Report an issue</a><button class="add-ticket-big add-ticket-top" onclick="openAddTicket()"><span class="plus">+</span><span>Add Ticket</span></button><div id="home-tonight"></div><div id="home-tabs"></div>`;
+    // v26: the news host lives BELOW the tickets/community panels in <main>,
+    // so Home opens on his tickets and the news sits at the bottom, collapsed.
+    const news = document.createElement('div');
+    news.id = 'home-news';
+    news.hidden = state.view !== 'home';
+    const comm = $('#view-community');
+    comm.parentNode.insertBefore(news, comm.nextSibling);
   }
   updateFab();
   renderHomeTabs();
+  renderTonight();
   renderNews();
   if (state.homeTab === 'tickets') renderTickets(); else renderCommunity();
 }
@@ -1504,7 +1639,7 @@ function renderHomeTabs() {
 async function renderPeople() {
   const el = $('#view-people');
   if (!state.user) { el.innerHTML = '<h2>People</h2>' + signInPromptHTML('Sign in to follow people, approve followers, and see their tickets on the Board.'); return; }
-  el.innerHTML = '<h2>People</h2><div id="people-body"><div class="empty">Loading people…</div></div>';
+  el.innerHTML = '<h2>People</h2><div id="people-body">' + skeletonHTML(3) + '</div>';
   try {
     const d = await api('GET', '/api/people');
     state.peopleCache = d;
@@ -1545,8 +1680,232 @@ async function peopleRemoveAll(btn) {
   catch (e) { showToast(e.message); }
 }
 
+/* ============ v27: TONIGHT STRIP + EXPOSURE + SHARE + SEARCH ============ */
+function etToday() { return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); }
+function groupIsTonight(g) {
+  const today = etToday();
+  if (g.game) {
+    if (g.game.state === 'in') return true; // live right now = tonight
+    if (g.game.start) {
+      const d = new Date(g.game.start);
+      if (!Number.isNaN(d.getTime())) return d.toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) === today;
+    }
+  }
+  // Fall back to the legs' own start times (naive ET wall time, as entered).
+  return g.legs.some((l) => l.startsAt && String(l.startsAt).slice(0, 10) === today);
+}
+function tonightGroups() {
+  const out = [];
+  if (!state.user) return out;
+  for (const t of state.tickets) {
+    if (t.status !== 'open') continue;
+    for (const g of groupLegsByGame(t)) if (groupIsTonight(g)) out.push({ ticket: t, group: g });
+  }
+  return out;
+}
+function renderTonight() {
+  const el = $('#home-tonight');
+  if (!el) return;
+  const entries = tonightGroups();
+  if (!entries.length) { el.innerHTML = ''; return; } // no legs tonight = no strip at all
+  const legCount = entries.reduce((n, e) => n + e.group.legs.length, 0);
+  const ticketCount = new Set(entries.map((e) => e.ticket.id)).size;
+  el.innerHTML = `<div class="card tonight-card"><div class="row between"><strong>🌙 Tonight</strong><span class="small muted">${legCount} leg${legCount === 1 ? '' : 's'} · ${ticketCount} ticket${ticketCount === 1 ? '' : 's'}</span></div>`
+    + entries.map(({ ticket: t, group: g }) => `<div class="tonight-game">${stripHTML(g)}${g.legs.map((l) => {
+      const dotCls = l.status === 'won' ? 'won' : l.status === 'lost' ? 'lost' : (g.game && g.game.state === 'in' && l.status === 'pending') ? 'live' : '';
+      return `<button class="tonight-leg" onclick="openTonightTicket(${t.id})"><span class="row" style="gap:8px;min-width:0"><span class="legdot ${dotCls}"></span><span class="tonight-sel">${esc(shortPick(l))}</span></span><span class="row" style="gap:8px;flex:none"><span class="small muted">${esc(marketLabel(l))}</span>${l.status !== 'pending' ? legStatusPill(l) : ''}<strong class="hr-odds">${fmtOdds(l.odds)}</strong></span></button>`;
+    }).join('')}</div>`).join('')
+    + '</div>';
+}
+function openTonightTicket(id) {
+  state.ticketSeg = 'current';
+  if (!state.expandedTickets) state.expandedTickets = new Set();
+  state.expandedTickets.add(id);
+  setHomeTab('tickets');
+  setTimeout(() => { const c = document.getElementById(`ticket-card-${id}`); if (c) c.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 80);
+}
+/* Exposure at a glance — computed client-side from the loaded tickets. */
+const fmtUnits = (n) => `${Math.round((Number(n) || 0) * 100) / 100}`;
+function tonightExposure() {
+  const seen = new Map();
+  for (const e of tonightGroups()) if (!seen.has(e.ticket.id)) seen.set(e.ticket.id, e.ticket);
+  let units = 0;
+  for (const t of seen.values()) units += Number(t.stake) || 0;
+  return { units, count: seen.size };
+}
+function updateTonightBar() {
+  const bar = $('#tonight-bar');
+  if (!bar) return;
+  // Signed out, or tickets not loaded yet this session: hide the bar.
+  // Signed in with tickets loaded: always show the figure (0u included) so
+  // tonight's exposure is readable at a glance.
+  if (!state.user || !state._cached.tickets) { bar.hidden = true; return; }
+  const { units, count } = tonightExposure();
+  bar.hidden = false;
+  bar.textContent = count ? `Tonight: ${fmtUnits(units)}u across ${count} ticket${count === 1 ? '' : 's'}` : 'Tonight: 0u';
+}
+function goTonight() {
+  showView('home');
+  setTimeout(() => { const el = $('#home-tonight'); if (el && el.firstChild) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 80);
+}
+/* Ticket search controls (the filter itself lives in filteredTickets). */
+function setTicketQuery(v) { state.ticketQuery = v; renderTicketsLight(); }
+function clearTicketQuery() {
+  state.ticketQuery = '';
+  const i = $('#ticket-search');
+  if (i) { i.value = ''; i.focus(); }
+  renderTicketsLight();
+}
+/* Share a ticket as a brand card image (client-side canvas, no server). */
+function ctxWrap(x, text, maxW, maxLines) {
+  const words = String(text || '').split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    const test = cur ? cur + ' ' + w : w;
+    if (x.measureText(test).width <= maxW || !cur) { cur = test; continue; }
+    lines.push(cur); cur = w;
+    if (lines.length === maxLines) { cur = ''; break; }
+  }
+  if (cur && lines.length < maxLines) lines.push(cur);
+  if (lines.length === maxLines) {
+    const joined = lines.join(' ');
+    if (words.join(' ') !== joined) {
+      let last = lines[maxLines - 1];
+      while (last.length && x.measureText(last + '…').width > maxW) last = last.slice(0, -1);
+      lines[maxLines - 1] = last + '…';
+    }
+  }
+  return lines;
+}
+function renderTicketImage(t) {
+  return new Promise((resolve) => {
+    const W = 1080, pad = 56;
+    const FONT = (w, s) => `${w} ${s}px -apple-system, "Segoe UI", Roboto, Arial, sans-serif`;
+    const meas = document.createElement('canvas').getContext('2d');
+    meas.font = FONT(800, 52);
+    const titleLines = ctxWrap(meas, t.title || `${t.legs.length}-Bet Parlay`, W - pad * 2, 2);
+    meas.font = FONT(800, 40);
+    const legBlocks = t.legs.map((l) => ({
+      sel: ctxWrap(meas, l.selection, W - pad * 2 - 180, 2),
+      sub: `${marketLabel(l)}${l.line ? ' · ' + l.line : ''} · ${l.league}${l.status !== 'pending' ? ' · ' + l.status.toUpperCase() : ''}`,
+      game: l.gameLabel || '',
+      odds: fmtOdds(l.odds),
+    }));
+    const statusLine = t.status === 'won' ? `WON · ${fmtMoney(t.payout)}` : t.status === 'lost' ? 'LOST' : t.status === 'push' ? 'PUSH' : null;
+    const legsH = legBlocks.reduce((n, b) => n + b.sel.length * 50 + 42 + (b.game ? 36 : 0) + 24, 0);
+    const H = 172 + (titleLines.length - 1) * 62 + 48 + (statusLine ? 50 : 0) + 34 + legsH + 44 + 74 + 52 + 56 + 44;
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const x = c.getContext('2d');
+    x.fillStyle = '#080d0c'; x.fillRect(0, 0, W, H);
+    x.fillStyle = '#38e69b'; x.fillRect(0, 0, W, 10);
+    x.textBaseline = 'alphabetic';
+    let y = 88;
+    x.fillStyle = '#38e69b'; x.font = FONT(900, 44);
+    x.fillText('SWEAT ⚡ WITH WILK', pad, y);
+    y = 172;
+    x.fillStyle = '#e8f5ee'; x.font = FONT(800, 52);
+    for (const line of titleLines) { x.fillText(line, pad, y); y += 62; }
+    y -= 62;
+    y += 48;
+    x.fillStyle = '#8fb3a1'; x.font = FONT(400, 30);
+    x.fillText(`${t.sportsbook || ''} · ${fmtDateTime(t.createdAt)}`, pad, y);
+    if (statusLine) {
+      y += 50;
+      x.fillStyle = t.status === 'won' ? '#38e69b' : t.status === 'lost' ? '#ff5c5c' : '#ffc857';
+      x.font = FONT(800, 34);
+      x.fillText(statusLine, pad, y);
+    }
+    y += 34;
+    x.fillStyle = '#1f2f27'; x.fillRect(pad, y, W - pad * 2, 2);
+    y += 78;
+    for (const b of legBlocks) {
+      x.fillStyle = '#e8f5ee'; x.font = FONT(800, 40);
+      b.sel.forEach((line, i) => {
+        x.fillText(line, pad, y);
+        if (i === 0) { x.fillStyle = '#38e69b'; x.textAlign = 'right'; x.fillText(b.odds, W - pad, y); x.textAlign = 'left'; x.fillStyle = '#e8f5ee'; }
+        y += 50;
+      });
+      y -= 50;
+      y += 42;
+      x.fillStyle = '#8fb3a1'; x.font = FONT(400, 30);
+      x.fillText(b.sub, pad, y);
+      if (b.game) { y += 36; x.font = FONT(400, 28); x.fillText(b.game, pad, y); }
+      y += 24 + 42;
+    }
+    y -= 66;
+    y += 44;
+    x.fillStyle = '#1f2f27'; x.fillRect(pad, y, W - pad * 2, 2);
+    y += 74;
+    x.fillStyle = '#8fb3a1'; x.font = FONT(400, 30);
+    x.fillText(t.legs.length > 1 ? 'Combined odds' : 'Odds', pad, y);
+    x.fillStyle = '#38e69b'; x.font = FONT(900, 54); x.textAlign = 'right';
+    x.fillText(fmtOdds(t.combinedOdds), W - pad, y);
+    x.textAlign = 'left';
+    y += 52;
+    x.fillStyle = '#e8f5ee'; x.font = FONT(400, 30);
+    x.fillText(`Wager ${fmtMoney(t.stake)} · Payout ${fmtMoney(t.boostedPayout || t.potentialPayout)}`, pad, y);
+    y += 56;
+    x.fillStyle = '#8fb3a1'; x.font = FONT(400, 26);
+    x.fillText('sweat-with-wilk.onrender.com', pad, y);
+    if (c.toBlob) c.toBlob((b) => resolve(b), 'image/png');
+    else resolve(null);
+  });
+}
+async function shareTicketCard(id, btn) {
+  const t = state.tickets.find((tk) => tk.id === id);
+  if (!t) return;
+  try {
+    if (btn) btn.disabled = true;
+    const blob = await renderTicketImage(t);
+    if (!blob) throw new Error('image render failed');
+    const file = new File([blob], `sweat-with-wilk-ticket-${t.id}.png`, { type: 'image/png' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: 'Sweat With Wilk — my ticket' });
+    } else {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = file.name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      showToast('Card image downloaded.');
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') return; // user closed the share sheet — not an error
+    showToast('Share failed: ' + (e.message || e));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 /* ================= boot + refresh ================= */
+function hydrateFromCache() {
+  // Pre-load last session's payloads into state. Nothing paints from here:
+  // refreshMe() confirms the signed-in user first and drops this data if the
+  // cache belongs to a different account (or nobody is signed in).
+  let uid = null;
+  try { uid = localStorage.getItem(CACHE_UID_KEY); } catch { /* ignore */ }
+  if (!uid) return;
+  const tk = cacheGet('tickets', uid);
+  if (tk && Array.isArray(tk.tickets)) { state.tickets = tk.tickets; state._cached.tickets = true; }
+  const bk = cacheGet('bankroll', uid);
+  if (bk && typeof bk === 'object') { state.bankroll = bk; state._cached.bankroll = true; }
+  const bd = cacheGet('board', uid);
+  if (bd && bd.date && Array.isArray(bd.plays)) { state.boardCache = bd; state._cached.board = true; }
+}
 (async function boot() {
+  hydrateFromCache();
   await refreshMe();
   render();
+  refreshHeaderBankroll();
 })();
+// Returning to the app triggers ONE fresh sync — no timers, no polling
+// (Wilkerson's standing rule). Skipped while a sheet is open mid-flow.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !state.user) return;
+  const sr = $('#sheet-root');
+  if (sr && sr.firstChild) return;
+  render();
+  refreshHeaderBankroll();
+});
