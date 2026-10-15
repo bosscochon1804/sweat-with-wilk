@@ -223,6 +223,20 @@ async function initDb() {
     const names = (cols.rows || []).map((r) => r.name);
     if (!names.includes('combined_override')) await client.execute('ALTER TABLE tickets ADD COLUMN combined_override INTEGER');
   } catch { /* best-effort */ }
+  // Hot-path indexes (2026-10-15 speed pass). CREATE INDEX IF NOT EXISTS is
+  // idempotent, so this is safe on every boot, local file or Turso.
+  try {
+    for (const sql of [
+      'CREATE INDEX IF NOT EXISTS idx_tickets_user ON tickets(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)',
+      'CREATE INDEX IF NOT EXISTS idx_legs_ticket ON legs(ticket_id)',
+      'CREATE INDEX IF NOT EXISTS idx_board_plays_date ON board_plays(board_date)',
+      'CREATE INDEX IF NOT EXISTS idx_comments_post ON community_comments(post_id)',
+      'CREATE INDEX IF NOT EXISTS idx_reactions_post ON community_reactions(post_id)',
+      'CREATE INDEX IF NOT EXISTS idx_reactions_user ON community_reactions(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows(followee_id)',
+    ]) await client.execute(sql);
+  } catch { /* best-effort */ }
 }
 
 /* ---------------- small utils ---------------- */
@@ -1437,8 +1451,8 @@ async function alertCycle() {
 }
 
 /* ---------------- serialization ---------------- */
-async function ticketJSON(t) {
-  const legs = await db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(t.id);
+async function ticketJSON(t, preLegs) {
+  const legs = preLegs || await db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(t.id);
   const combined = legs.reduce((a, l) => a * decimalFromAmerican(l.odds), 1);
   // SGP tickets carry one real combined price (the book never showed per-leg
   // odds) — when it is set, it wins over the leg-multiplied figure.
@@ -1457,8 +1471,8 @@ async function ticketJSON(t) {
     })),
   };
 }
-async function ticketJSONWithGames(t) {
-  const base = await ticketJSON(t);
+async function ticketJSONWithGames(t, preLegs) {
+  const base = await ticketJSON(t, preLegs);
   if (t.status === 'open') {
     const leagues = [...new Set(base.legs.map((l) => l.league))];
     const map = {};
@@ -1468,7 +1482,7 @@ async function ticketJSONWithGames(t) {
     }
     base.games = {};
     for (const leg of base.legs) {
-      const legsRaw = await db.prepare('SELECT * FROM legs WHERE id = ?').get(leg.id);
+      const legsRaw = preLegs ? preLegs.find((l) => l.id === leg.id) : await db.prepare('SELECT * FROM legs WHERE id = ?').get(leg.id);
       const game = matchGameForLeg(legsRaw, Object.values(map).filter((g) => g.league === leg.league));
       if (game) base.games[leg.id] = game;
     }
@@ -1520,21 +1534,58 @@ async function ensureTicketShare(ownerId, ticketId, bodyText) {
 async function communityJSON(viewer) {
   const posts = await db.prepare('SELECT p.*, u.username, u.display_name FROM community_posts p JOIN users u ON u.id = p.user_id ORDER BY p.id DESC LIMIT 100').all();
   const out = [];
-  for (const p of posts) {
-    const comments = (await db.prepare('SELECT c.*, u.username, u.display_name FROM community_comments c JOIN users u ON u.id = c.user_id WHERE c.post_id = ? ORDER BY c.id').all(p.id))
-      .map((c) => ({ id: c.id, authorName: displayNameOf(c), body: c.body, createdAt: c.created_at }));
-    const reactions = [];
-    for (const r of ['respect', 'tail', 'hot']) {
-      const cnt = (await db.prepare('SELECT COUNT(*) AS n FROM community_reactions WHERE post_id = ? AND reaction = ?').get(p.id, r)).n;
-      const mine = viewer ? !!(await db.prepare('SELECT id FROM community_reactions WHERE post_id = ? AND user_id = ? AND reaction = ?').get(p.id, viewer.id, r)) : false;
-      reactions.push({ reaction: r, count: cnt, mine });
+  if (posts.length) {
+    /* Batched feed assembly (2026-10-15 speed fix): the old loop ran ~8
+       sequential queries PER POST (comments, 3 reaction counts, 3 reaction
+       "mine" checks, ticket + legs) — 200+ Turso round trips per feed load,
+       10-30s on the live app. Everything below is one query per data type,
+       grouped in JS; the JSON shape and ordering are unchanged. */
+    const postIds = posts.map((p) => p.id);
+    const postPh = postIds.map(() => '?').join(',');
+    const commentRows = await db.prepare(`SELECT c.*, u.username, u.display_name FROM community_comments c JOIN users u ON u.id = c.user_id WHERE c.post_id IN (${postPh}) ORDER BY c.id`).all(...postIds);
+    const commentsByPost = new Map();
+    for (const c of commentRows) {
+      const arr = commentsByPost.get(c.post_id) || [];
+      arr.push({ id: c.id, authorName: displayNameOf(c), body: c.body, createdAt: c.created_at });
+      commentsByPost.set(c.post_id, arr);
     }
-    let ticket = null;
-    if (p.kind === 'ticket' && p.ticket_id) {
-      const t = await db.prepare('SELECT * FROM tickets WHERE id = ?').get(p.ticket_id);
-      if (t) { const tj = await ticketJSON(t); ticket = { ticketId: t.id, title: tj.title, sportsbook: tj.sportsbook, stake: tj.stake, combinedOdds: tj.combinedOdds, payout: tj.potentialPayout, outcome: tj.status === 'open' ? 'live' : tj.status, legs: tj.legs }; }
+    const countRows = await db.prepare(`SELECT post_id, reaction, COUNT(*) AS n FROM community_reactions WHERE post_id IN (${postPh}) GROUP BY post_id, reaction`).all(...postIds);
+    const countsByPost = new Map();
+    for (const r of countRows) {
+      const m = countsByPost.get(r.post_id) || {};
+      m[r.reaction] = r.n;
+      countsByPost.set(r.post_id, m);
     }
-    out.push({ id: p.id, kind: p.kind, authorName: displayNameOf(p), body: p.body, createdAt: p.created_at, comments, reactions, ticket, mine: viewer ? p.user_id === viewer.id : false });
+    const mineSet = new Set();
+    if (viewer) {
+      const mineRows = await db.prepare(`SELECT post_id, reaction FROM community_reactions WHERE user_id = ? AND post_id IN (${postPh})`).all(viewer.id, ...postIds);
+      for (const r of mineRows) mineSet.add(r.post_id + ':' + r.reaction);
+    }
+    const ticketIds = [...new Set(posts.filter((p) => p.kind === 'ticket' && p.ticket_id).map((p) => p.ticket_id))];
+    const ticketEntryById = new Map();
+    if (ticketIds.length) {
+      const ticketPh = ticketIds.map(() => '?').join(',');
+      const ticketRows = await db.prepare(`SELECT * FROM tickets WHERE id IN (${ticketPh})`).all(...ticketIds);
+      const legRows = await db.prepare(`SELECT * FROM legs WHERE ticket_id IN (${ticketPh}) ORDER BY id`).all(...ticketIds);
+      const legsByTicket = new Map();
+      for (const l of legRows) {
+        const arr = legsByTicket.get(l.ticket_id) || [];
+        arr.push(l);
+        legsByTicket.set(l.ticket_id, arr);
+      }
+      for (const t of ticketRows) ticketEntryById.set(t.id, { row: t, legs: legsByTicket.get(t.id) || [] });
+    }
+    for (const p of posts) {
+      const comments = commentsByPost.get(p.id) || [];
+      const counts = countsByPost.get(p.id) || {};
+      const reactions = ['respect', 'tail', 'hot'].map((r) => ({ reaction: r, count: counts[r] || 0, mine: viewer ? mineSet.has(p.id + ':' + r) : false }));
+      let ticket = null;
+      if (p.kind === 'ticket' && p.ticket_id) {
+        const entry = ticketEntryById.get(p.ticket_id);
+        if (entry) { const tj = await ticketJSON(entry.row, entry.legs); ticket = { ticketId: entry.row.id, title: tj.title, sportsbook: tj.sportsbook, stake: tj.stake, combinedOdds: tj.combinedOdds, payout: tj.potentialPayout, outcome: tj.status === 'open' ? 'live' : tj.status, legs: tj.legs }; }
+      }
+      out.push({ id: p.id, kind: p.kind, authorName: displayNameOf(p), body: p.body, createdAt: p.created_at, comments, reactions, ticket, mine: viewer ? p.user_id === viewer.id : false });
+    }
   }
   // leaderboard: ONLY real graded results
   const lb = await db.prepare(`
@@ -1670,10 +1721,25 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/tickets' && req.method === 'GET') {
       const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
-      await settleAll();
+      // No in-request settleAll (2026-10-15 speed pass): it scanned EVERY
+      // user's open tickets + ESPN feeds inside this page load. Settling is
+      // handled by the background loop (boot + every 60s, see startup), so
+      // tickets still auto-settle — just not on the critical path of a load.
       const rows = await db.prepare('SELECT * FROM tickets WHERE user_id = ? ORDER BY id DESC').all(u.id);
       const out = [];
-      for (const t of rows) out.push(await ticketJSONWithGames(t));
+      if (rows.length) {
+        // Batched legs for the whole list (2026-10-15 speed fix) — one query
+        // instead of a legs query per ticket; shape unchanged.
+        const ticketPh = rows.map(() => '?').join(',');
+        const legRows = await db.prepare(`SELECT * FROM legs WHERE ticket_id IN (${ticketPh}) ORDER BY id`).all(...rows.map((t) => t.id));
+        const legsByTicket = new Map();
+        for (const l of legRows) {
+          const arr = legsByTicket.get(l.ticket_id) || [];
+          arr.push(l);
+          legsByTicket.set(l.ticket_id, arr);
+        }
+        for (const t of rows) out.push(await ticketJSONWithGames(t, legsByTicket.get(t.id) || []));
+      }
       return sendJSON(res, 200, { tickets: out });
     }
     if (p === '/api/tickets' && req.method === 'POST') {
@@ -1786,8 +1852,20 @@ const server = http.createServer(async (req, res) => {
       const tickets = await db.prepare("SELECT * FROM tickets WHERE user_id = ? AND status = 'open' ORDER BY id DESC").all(u.id);
       const out = [];
       const gamesCache = {};
+      // Batched legs for all open tickets (2026-10-15 speed fix) — one query
+      // instead of a legs query per ticket; shape unchanged.
+      const legsByTicket = new Map();
+      if (tickets.length) {
+        const ticketPh = tickets.map(() => '?').join(',');
+        const legRows = await db.prepare(`SELECT * FROM legs WHERE ticket_id IN (${ticketPh}) ORDER BY id`).all(...tickets.map((t) => t.id));
+        for (const l of legRows) {
+          const arr = legsByTicket.get(l.ticket_id) || [];
+          arr.push(l);
+          legsByTicket.set(l.ticket_id, arr);
+        }
+      }
       for (const t of tickets) {
-        const legs = await db.prepare('SELECT * FROM legs WHERE ticket_id = ? ORDER BY id').all(t.id);
+        const legs = legsByTicket.get(t.id) || [];
         for (const leg of legs) {
           const prop = parseProp(leg);
           if (!prop) continue;
@@ -1931,7 +2009,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/bankroll' && req.method === 'GET') {
       const u = await currentUser(req);
       if (!u) return sendJSON(res, 401, { error: 'Sign in required.' });
-      await settleAll();
+      // Settle runs on the background loop (see GET /api/tickets note) — not in this request.
       return sendJSON(res, 200, await bankrollFor(u.id));
     }
 
