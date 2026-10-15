@@ -42,7 +42,7 @@ function fmtDay(dateStr) {
   const d = new Date(dateStr + 'T12:00:00');
   return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
 }
-const LEAGUES = ['NFL', 'NBA', 'MLB', 'NHL', 'NCAAF', 'WNBA', 'NCAAB', 'NCAAW', 'UFC'];
+const LEAGUES = ['NFL', 'NBA', 'MLB', 'NHL', 'NCAAF', 'WNBA', 'NCAAB', 'NCAAW', 'UFC', 'MLS', 'EPL', 'TENNIS'];
 const SCORE_PILLS = ['NFL', 'NHL', 'MLB', 'SOCCER', 'NBA', 'NCAAF', 'WNBA', 'NCAAB', 'NCAAW', 'UFC', 'ALL'];
 const SCORE_FETCH = { SOCCER: ['MLS', 'EPL'], ALL: ['NFL', 'NCAAF', 'NBA', 'NCAAB', 'NCAAW', 'WNBA', 'MLB', 'NHL', 'MLS', 'EPL', 'UFC'] };
 const NEWS_LEAGUES = ['ALL', 'NFL', 'NHL', 'MLB', 'NBA', 'SOCCER', 'NCAAF', 'UFC', 'WNBA', 'NCAAB', 'NCAAW'];
